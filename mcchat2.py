@@ -4,9 +4,10 @@ from __future__ import print_function
 
 import sys
 import time
+import re
 import argparse
 import getpass
-from threading import Thread, Condition
+from threading import Thread, Condition, Lock
 import thread
 
 import minecraft.authentication as authentication
@@ -47,12 +48,15 @@ def connect(uname, pword, host, port=None, offline=False):
         auth = authentication.AuthenticationToken('-', '-', '-')
         auth.profile.id_ = '-'
         auth.profile.name = uname
+        auth.join = lambda *a, **k: None
     else:
         auth = authentication.AuthenticationToken()
         auth.authenticate(uname, pword)
 
     conn = connection.Connection(host, port, auth)
     keepalive_cond = Condition()
+    query_cond = Condition()
+    query_cond.set = set()
 
     conn.register_packet_listener(h_join_game,
         packets.JoinGamePacket)
@@ -63,68 +67,109 @@ def connect(uname, pword, host, port=None, offline=False):
     conn.register_packet_listener(h_disconnect,
         packets.DisconnectPacket, packets.DisconnectPacketPlayState)
 
-    stdin = Thread(name='stdin', target=stdin_thread, args=(
-        conn,))
+    query = Thread(name='query', target=query_thread,
+        args=(query_cond, host, port))
+    query.daemon = True
+
+    stdin = Thread(name='stdin', target=stdin_thread,
+        args=(conn, query_cond))
     stdin.daemon = True
 
-    timeout = Thread(name='timeout', target=timeout_thread, args=(
-        keepalive_cond,))
+    timeout = Thread(name='timeout', target=timeout_thread, 
+        args=(keepalive_cond,))
     timeout.daemon = True
 
     conn.connect()
+    query.start()
     stdin.start()
     timeout.start()
     main_thread(conn)
   
 def h_join_game(packet):
-    print('Connected to server.')
+    fprint('Connected to server.')
 
 def h_chat_message(packet):
-    print(json_chat.decode_string(packet.json_data))
+    fprint(json_chat.decode_string(packet.json_data))
 
 def h_keepalive(keepalive_cond, packet):
-    keepalive_cond.acquire()
-    keepalive_cond.value = True
-    keepalive_cond.notify_all()
-    keepalive_cond.release()
+    with keepalive_cond:
+        keepalive_cond.value = True
+        keepalive_cond.notify_all()
 
 def h_disconnect(packet):
     msg = json_chat.decode_string(packet.json_data)
-    print('Disconnected from server: %s' % msg)
+    fprint('Disconnected from server: %s' % msg)
     thread.interrupt_main()
 
 def main_thread(conn):
     try:
         while conn.networking_thread.is_alive():
             conn.networking_thread.join(0.1)
-        print('Disconnected from server.')
+        fprint('Disconnected from server.')
     except KeyboardInterrupt as e:
         pass
 
 def timeout_thread(keepalive_cond):
     while True:
         start = time.clock()
-        keepalive_cond.acquire()
-        keepalive_cond.value = False
-        keepalive_cond.wait(KEEPALIVE_TIMEOUT_S)
-        keepalive_cond.release()
-        if not keepalive_cond.value: break
+        with keepalive_cond:
+            keepalive_cond.value = False
+            keepalive_cond.wait(KEEPALIVE_TIMEOUT_S)
+            if not keepalive_cond.value: break
 
-    print('Disconnected from server: timed out.')
+    fprint('Disconnected from server: timed out.')
     thread.interrupt_main()
 
-def stdin_thread(conn):
+def query_thread(query_cond, host, port):
+    while True:
+        with query_cond:
+            query_cond.wait()
+
+        server = mcstatus.MinecraftServer(host, port)
+        try:
+            result = server.query()
+        except Exception as e:
+            result = e
+
+        with query_cond:
+            for query in query_cond.set:
+                if isinstance(result, Exception):
+                    fprint('!query failure %s %s' % (query, result))
+                    continue
+                elif query == 'map':
+                    result = result.map
+                elif query == 'players':
+                    result = ' '.join(result.players.names)
+                fprint('!query success %s %s' % (query, result))
+            query_cond.set.clear()
+
+def stdin_thread(conn, query_cond):
     def send_chat(conn, text):
         packet = packets.ChatPacket()
         packet.message = text
         conn.write_packet(packet)
     while True:
         text = raw_input().decode('utf8')
+        
+        match = re.match(r'\?query\s+(\S+)\s*$', text)
+        if match:
+            with query_cond:
+                query_cond.set.add(match.group(1))
+                query_cond.notify_all()
+            continue
+        
         while len(text) > 100:
             send_chat(text[:97] + '...')
             text = '...' + text[97:]
         if text:
             send_chat(conn, text)
+    
+    query_cond.acquire()
+    sys.exit()
+
+def fprint(*args, **kwds):
+    print(*args, **kwds)
+    kwds.get('file', sys.stdout).flush()
 
 if __name__ == '__main__':
     main()
