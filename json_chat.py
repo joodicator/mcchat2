@@ -35,8 +35,8 @@ def decode_struct(data):
     elif type(data) is dict:
         if 'text' in data:
             result = decode_struct(data['text'])
-        elif 'translate' in data and ('using' in data or 'with' in data):
-            using = data.get('using') or data.get('with')
+        elif 'translate' in data:
+            using = data.get('using') or data.get('with') or []
             using = [decode_struct(item) for item in using]
             result = translate(data['translate'], using)
         else:

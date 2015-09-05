@@ -55,15 +55,23 @@ def connect(uname, pword, host, port=None, offline=False):
 
     conn = connection.Connection(host, port, auth)
     keepalive_cond = Condition()
+
     query_cond = Condition()
     query_cond.set = set()
+    
+    plist_cond = Condition()
+    plist_cond.list = packets.PlayerListItemPacket.PlayerList()
 
     conn.register_packet_listener(h_join_game,
         packets.JoinGamePacket)
     conn.register_packet_listener(h_chat_message,
         packets.ChatMessagePacket)
-    conn.register_packet_listener(lambda p: h_keepalive(keepalive_cond, p),
+    conn.register_packet_listener(lambda p:
+            h_keepalive(keepalive_cond, p),
         packets.KeepAlivePacket)
+    conn.register_packet_listener(lambda p:
+            h_player_list_item(plist_cond, p),
+        packets.PlayerListItemPacket)
     conn.register_packet_listener(h_disconnect,
         packets.DisconnectPacket, packets.DisconnectPacketPlayState)
 
@@ -72,7 +80,7 @@ def connect(uname, pword, host, port=None, offline=False):
     query.daemon = True
 
     stdin = Thread(name='stdin', target=stdin_thread,
-        args=(conn, query_cond))
+        args=(conn, query_cond, plist_cond))
     stdin.daemon = True
 
     timeout = Thread(name='timeout', target=timeout_thread, 
@@ -95,6 +103,10 @@ def h_keepalive(keepalive_cond, packet):
     with keepalive_cond:
         keepalive_cond.value = True
         keepalive_cond.notify_all()
+
+def h_player_list_item(plist_cond, packet):
+    with plist_cond:
+        packet.apply(plist_cond.list)
 
 def h_disconnect(packet):
     msg = json_chat.decode_string(packet.json_data)
@@ -143,26 +155,31 @@ def query_thread(query_cond, host, port):
                 fprint('!query success %s %s' % (query, result))
             query_cond.set.clear()
 
-def stdin_thread(conn, query_cond):
+def stdin_thread(conn, query_cond, plist_cond):
     def send_chat(conn, text):
         packet = packets.ChatPacket()
         packet.message = text
         conn.write_packet(packet)
     while True:
-        text = raw_input().decode('utf8')
-        
+        text = raw_input().decode('utf8')        
         match = re.match(r'\?query\s+(\S+)\s*$', text)
-        if match:
+        if match and match.group(1) == 'players':
+            with plist_cond:
+                players = ' '.join(
+                    json_chat.decode_string(p.display_name)
+                        if p.display_name else p.name
+                    for p in plist_cond.list.players_by_uuid.itervalues())
+            fprint('!query success players %s' % players)
+        elif match:
             with query_cond:
                 query_cond.set.add(match.group(1))
                 query_cond.notify_all()
-            continue
-        
-        while len(text) > 100:
-            send_chat(text[:97] + '...')
-            text = '...' + text[97:]
-        if text:
-            send_chat(conn, text)
+        else:
+            while len(text) > 100:
+                send_chat(text[:97] + '...')
+                text = '...' + text[97:]
+            if text:
+                send_chat(conn, text)
     
     query_cond.acquire()
     sys.exit()
