@@ -97,7 +97,7 @@ def h_join_game(packet):
     fprint('Connected to server.')
 
 def h_chat_message(packet):
-    fprint(json_chat.decode_string(packet.json_data))
+    fprint(json_chat.decode_string(packet.json_data).encode('utf8'))
 
 def h_keepalive(keepalive_cond, packet):
     with keepalive_cond:
