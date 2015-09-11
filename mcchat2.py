@@ -176,7 +176,7 @@ def stdin_thread(conn, query_cond, plist_cond):
                 query_cond.notify_all()
         else:
             while len(text) > 100:
-                send_chat(text[:97] + '...')
+                send_chat(conn, text[:97] + '...')
                 text = '...' + text[97:]
             if text:
                 send_chat(conn, text)
