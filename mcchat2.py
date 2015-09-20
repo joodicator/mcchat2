@@ -95,7 +95,8 @@ def connect(uname, pword, host, port=None, offline=False, plugins=None):
     conn.register_packet_listener(lambda p:
             h_player_list_item(plist_cond, p),
         packets.PlayerListItemPacket)
-    conn.register_packet_listener(h_disconnect,
+    conn.register_packet_listener(lambda p:
+            h_disconnect(connected_cond, p),
         packets.DisconnectPacket, packets.DisconnectPacketPlayState)
 
     for plugin in plugins or ():
@@ -130,8 +131,8 @@ def h_player_list_item(plist_cond, packet):
 def h_disconnect(connected_cond, packet):
     msg = json_chat.decode_string(packet.json_data)
     with connected_cond:
-        if connected_cond.connected:
-            fprint('Disconnected from server: %s' % msg)
+        pfile = sys.stdout if connected_cond.connected else sys.stderr
+        fprint('Disconnected from server: %s' % msg, file=pfile)
     thread.interrupt_main()
 
 def main_thread(connected_cond, conn):
@@ -139,8 +140,8 @@ def main_thread(connected_cond, conn):
         while conn.networking_thread.is_alive():
             conn.networking_thread.join(0.1)
         with connected_cond:
-            if connected_cond.connected:
-                fprint('Disconnected from server.')
+            pfile = sys.stdout if connected_cond.connected else sys.stderr
+            fprint('Disconnected from server.', file=pfile)
     except KeyboardInterrupt as e:
         pass
 
@@ -153,8 +154,8 @@ def timeout_thread(keepalive_cond, connected_cond):
             if not keepalive_cond.value: break
 
     with connected_cond:
-        if connected_cond.connected:
-            fprint('Disconnected from server: timed out.')
+        pfile = sys.stdout if connected_cond.connected else sys.stderr
+        fprint('Disconnected from server: timed out.', file=pfile)
 
     thread.interrupt_main()
 
