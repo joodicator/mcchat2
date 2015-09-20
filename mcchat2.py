@@ -9,6 +9,7 @@ import argparse
 import getpass
 from threading import Thread, Condition, Lock
 import thread
+import imp
 
 import minecraft.authentication as authentication
 import minecraft.networking.connection as connection
@@ -17,7 +18,7 @@ import minecraft.networking.packets as packets
 import mcstatus
 import json_chat
 
-KEEPALIVE_TIMEOUT_S = 20
+KEEPALIVE_TIMEOUT_S = 30
 
 def main():
     parser = argparse.ArgumentParser()
@@ -25,8 +26,9 @@ def main():
     parser.add_argument('uname', metavar='USERNAME')
     parser.add_argument('pword', metavar='PASSWORD', nargs='?')
     parser.add_argument('--offline', dest='offline', action='store_true')
-
+    parser.add_argument('--plugins', dest='plugins', metavar='NAME', nargs='+')
     args = parser.parse_args()
+
     host, port = (
         (args.addr.rsplit(':', 1)[0], int(args.addr.rsplit(':', 1)[1]))
         if ':' in args.addr else (args.addr, None))
@@ -39,9 +41,14 @@ def main():
     else:
         pword = args.pword
 
-    connect(args.uname, pword, host, port, offline=offline)
+    plugins = []
+    for plugin in args.plugins or ():
+        file, path, desc = imp.find_module(plugin, ['plugins'])
+        plugins.append(imp.load_module(plugin, file, path, desc))
 
-def connect(uname, pword, host, port=None, offline=False):
+    connect(args.uname, pword, host, port, offline=offline, plugins=plugins)
+
+def connect(uname, pword, host, port=None, offline=False, plugins=None):
     port = 25565 if port is None else port
 
     if offline:
@@ -62,7 +69,23 @@ def connect(uname, pword, host, port=None, offline=False):
     plist_cond = Condition()
     plist_cond.list = packets.PlayerListItemPacket.PlayerList()
 
-    conn.register_packet_listener(h_join_game,
+    connected_cond = Condition()
+    connected_cond.connected = False
+
+    timeout = Thread(name='timeout', target=timeout_thread, 
+        args=(keepalive_cond, connected_cond))
+    timeout.daemon = True
+
+    query = Thread(name='query', target=query_thread,
+        args=(query_cond, host, port))
+    query.daemon = True
+
+    stdin = Thread(name='stdin', target=stdin_thread,
+        args=(conn, query_cond, plist_cond, connected_cond))
+    stdin.daemon = True
+
+    conn.register_packet_listener(lambda p:
+            h_join_game(timeout, connected_cond, p),
         packets.JoinGamePacket)
     conn.register_packet_listener(h_chat_message,
         packets.ChatMessagePacket)
@@ -75,25 +98,21 @@ def connect(uname, pword, host, port=None, offline=False):
     conn.register_packet_listener(h_disconnect,
         packets.DisconnectPacket, packets.DisconnectPacketPlayState)
 
-    query = Thread(name='query', target=query_thread,
-        args=(query_cond, host, port))
-    query.daemon = True
-
-    stdin = Thread(name='stdin', target=stdin_thread,
-        args=(conn, query_cond, plist_cond))
-    stdin.daemon = True
-
-    timeout = Thread(name='timeout', target=timeout_thread, 
-        args=(keepalive_cond,))
-    timeout.daemon = True
+    for plugin in plugins or ():
+        plugin.install(conn)
 
     conn.connect()
     query.start()
     stdin.start()
-    timeout.start()
-    main_thread(conn)
-  
-def h_join_game(packet):
+
+    make_query(query_cond, 'map')
+    main_thread(connected_cond, conn)
+
+def h_join_game(timeout_thread, connected_cond, packet):
+    if not timeout_thread.is_alive():
+        timeout_thread.start()
+    with connected_cond:
+        connected_cond.connected = True
     fprint('Connected to server.')
 
 def h_chat_message(packet):
@@ -108,20 +127,24 @@ def h_player_list_item(plist_cond, packet):
     with plist_cond:
         packet.apply(plist_cond.list)
 
-def h_disconnect(packet):
+def h_disconnect(connected_cond, packet):
     msg = json_chat.decode_string(packet.json_data)
-    fprint('Disconnected from server: %s' % msg)
+    with connected_cond:
+        if connected_cond.connected:
+            fprint('Disconnected from server: %s' % msg)
     thread.interrupt_main()
 
-def main_thread(conn):
+def main_thread(connected_cond, conn):
     try:
         while conn.networking_thread.is_alive():
             conn.networking_thread.join(0.1)
-        fprint('Disconnected from server.')
+        with connected_cond:
+            if connected_cond.connected:
+                fprint('Disconnected from server.')
     except KeyboardInterrupt as e:
         pass
 
-def timeout_thread(keepalive_cond):
+def timeout_thread(keepalive_cond, connected_cond):
     while True:
         start = time.clock()
         with keepalive_cond:
@@ -129,7 +152,10 @@ def timeout_thread(keepalive_cond):
             keepalive_cond.wait(KEEPALIVE_TIMEOUT_S)
             if not keepalive_cond.value: break
 
-    fprint('Disconnected from server: timed out.')
+    with connected_cond:
+        if connected_cond.connected:
+            fprint('Disconnected from server: timed out.')
+
     thread.interrupt_main()
 
 def query_thread(query_cond, host, port):
@@ -155,7 +181,12 @@ def query_thread(query_cond, host, port):
                 fprint('!query success %s %s' % (query, result))
             query_cond.set.clear()
 
-def stdin_thread(conn, query_cond, plist_cond):
+def make_query(query_cond, query):
+    with query_cond:
+        query_cond.set.add(query)
+        query_cond.notify_all()
+
+def stdin_thread(conn, query_cond, plist_cond, connected_cond):
     def send_chat(conn, text):
         packet = packets.ChatPacket()
         packet.message = text
@@ -164,6 +195,9 @@ def stdin_thread(conn, query_cond, plist_cond):
         text = raw_input().decode('utf8')        
         match = re.match(r'\?query\s+(\S+)\s*$', text)
         if match and match.group(1) == 'players':
+            with connected_cond:
+                if not connected_cond.connected:
+                    continue
             with plist_cond:
                 players = ' '.join(
                     json_chat.decode_string(p.display_name)
@@ -171,9 +205,7 @@ def stdin_thread(conn, query_cond, plist_cond):
                     for p in plist_cond.list.players_by_uuid.itervalues())
             fprint('!query success players %s' % players)
         elif match:
-            with query_cond:
-                query_cond.set.add(match.group(1))
-                query_cond.notify_all()
+            make_query(query_cond, match.group(1))
         else:
             while len(text) > 100:
                 send_chat(conn, text[:97] + '...')
