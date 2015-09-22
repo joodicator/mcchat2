@@ -14,13 +14,19 @@ def install(conn):
 def h_map(packet):
     global map_set
     packet.apply_to_map_set(map_set)
-    if packet.pixels is None: return
-
     map = map_set.maps_by_id[packet.map_id]
-    file_path = os.path.join(
-        os.path.dirname(__file__), 'maps', 'map_%d.png' % map.id)
-    with open(file_path, 'w') as file:
-        mcmapimg.map_data_to_img(map.pixels, file,
-            width=map.width, height=map.height, warn=True)
-    print('mapimg: updated %s.' % file_path, file=sys.stderr)
 
+    if packet.pixels is not None:
+        file_path = os.path.join(
+            os.path.dirname(__file__), 'maps', 'map_%d.png' % map.id)
+        with open(file_path, 'w') as file:
+            mcmapimg.map_data_to_img(map.pixels, file,
+                width=map.width, height=map.height, warn=True)
+        print('mapimg: updated %s.' % file_path, file=sys.stderr)
+
+    file_path = os.path.join(
+        os.path.dirname(__file__), 'maps', 'map_%d_icons.png' % map.id)
+    icons = [(i.type, i.direction, i.location) for i in map.icons]
+    with open(file_path, 'w') as file:
+        mcmapimg.map_icons_to_img(icons, file,
+            width=map.width, height=map.height, scale=1)
