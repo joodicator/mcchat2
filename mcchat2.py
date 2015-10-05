@@ -18,7 +18,7 @@ import minecraft.networking.packets as packets
 import mcstatus
 import json_chat
 
-KEEPALIVE_TIMEOUT_S = 30
+KEEPALIVE_TIMEOUT_S = 60
 
 def main():
     parser = argparse.ArgumentParser()
@@ -141,7 +141,10 @@ def main_thread(connected_cond, conn):
             conn.networking_thread.join(0.1)
         with connected_cond:
             pfile = sys.stdout if connected_cond.connected else sys.stderr
-            fprint('Disconnected from server.', file=pfile)
+            reason = str(conn.exception) \
+                if hasattr(conn, 'exception') and conn.exception is not None \
+                else 'unknown error.'
+            fprint('Disconnected from server: %s' % reason, file=pfile)
     except KeyboardInterrupt as e:
         pass
 
@@ -155,7 +158,8 @@ def timeout_thread(keepalive_cond, connected_cond):
 
     with connected_cond:
         pfile = sys.stdout if connected_cond.connected else sys.stderr
-        fprint('Disconnected from server: timed out.', file=pfile)
+        fprint('Disconnected from server: timed out (%ss).'
+            % KEEPALIVE_TIMEOUT_S, file=pfile)
 
     thread.interrupt_main()
 
