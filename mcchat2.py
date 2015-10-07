@@ -2,23 +2,39 @@
 
 from __future__ import print_function
 
+from threading import Thread, Lock, RLock, Condition
+import threading
 import sys
 import time
+import os
+import os.path
 import re
 import argparse
 import getpass
-from threading import Thread, Condition, Lock
-import thread
+import socket
+import json
 import imp
+import traceback
+import functools
 
 import minecraft.authentication as authentication
 import minecraft.networking.connection as connection
 import minecraft.networking.packets as packets
+from minecraft.exceptions import YggdrasilError
 
 import mcstatus
 import json_chat
 
-KEEPALIVE_TIMEOUT_S = 60
+DEFAULT_PORT = 25565
+
+KEEPALIVE_TIMEOUT_S = 30
+STANDBY_QUERY_INTERVAL_S = 1
+
+AUTH_TOKEN_PATH = os.path.join(
+    os.path.dirname(__file__), 'var', 'authentication_token')
+AUTH_RATE_LIMIT_MESSAGE = "[403] ForbiddenOperationException: 'Invalid credentials.'"
+AUTH_ATTEMPTS_MAX = 6
+AUTH_RETRY_DELAY_S = 10
 
 def main():
     parser = argparse.ArgumentParser()
@@ -26,6 +42,7 @@ def main():
     parser.add_argument('uname', metavar='USERNAME')
     parser.add_argument('pword', metavar='PASSWORD', nargs='?')
     parser.add_argument('--offline', dest='offline', action='store_true')
+    parser.add_argument('--standby', dest='standby', action='store_true')
     parser.add_argument('--plugins', dest='plugins', metavar='NAME', nargs='+')
     args = parser.parse_args()
 
@@ -46,180 +63,448 @@ def main():
         file, path, desc = imp.find_module(plugin, ['plugins'])
         plugins.append(imp.load_module(plugin, file, path, desc))
 
-    connect(args.uname, pword, host, port, offline=offline, plugins=plugins)
+    client = Client(
+        uname=args.uname, pword=pword, host=host, port=port,
+        offline=offline, standby=args.standby, plugins=plugins)
 
-def connect(uname, pword, host, port=None, offline=False, plugins=None):
-    port = 25565 if port is None else port
-
-    if offline:
-        auth = authentication.AuthenticationToken('-', '-', '-')
-        auth.profile.id_ = '-'
-        auth.profile.name = uname
-        auth.join = lambda *a, **k: None
-    else:
-        auth = authentication.AuthenticationToken()
-        auth.authenticate(uname, pword)
-
-    conn = connection.Connection(host, port, auth)
-    keepalive_cond = Condition()
-
-    query_cond = Condition()
-    query_cond.set = set()
-    
-    plist_cond = Condition()
-    plist_cond.list = packets.PlayerListItemPacket.PlayerList()
-
-    connected_cond = Condition()
-    connected_cond.connected = False
-
-    timeout = Thread(name='timeout', target=timeout_thread, 
-        args=(keepalive_cond, connected_cond))
-    timeout.daemon = True
-
-    query = Thread(name='query', target=query_thread,
-        args=(query_cond, host, port))
-    query.daemon = True
-
-    stdin = Thread(name='stdin', target=stdin_thread,
-        args=(conn, query_cond, plist_cond, connected_cond))
-    stdin.daemon = True
-
-    conn.register_packet_listener(lambda p:
-            h_join_game(timeout, connected_cond, p),
-        packets.JoinGamePacket)
-    conn.register_packet_listener(h_chat_message,
-        packets.ChatMessagePacket)
-    conn.register_packet_listener(lambda p:
-            h_keepalive(keepalive_cond, p),
-        packets.KeepAlivePacket)
-    conn.register_packet_listener(lambda p:
-            h_player_list_item(plist_cond, p),
-        packets.PlayerListItemPacket)
-    conn.register_packet_listener(lambda p:
-            h_disconnect(connected_cond, p),
-        packets.DisconnectPacket, packets.DisconnectPacketPlayState)
-
-    for plugin in plugins or ():
-        plugin.install(conn)
-
-    conn.connect()
-    query.start()
-    stdin.start()
-
-    make_query(query_cond, 'map')
-    main_thread(connected_cond, conn)
-
-def h_join_game(timeout_thread, connected_cond, packet):
-    if not timeout_thread.is_alive():
-        timeout_thread.start()
-    with connected_cond:
-        connected_cond.connected = True
-    fprint('Connected to server.')
-
-def h_chat_message(packet):
-    fprint(json_chat.decode_string(packet.json_data).encode('utf8'))
-
-def h_keepalive(keepalive_cond, packet):
-    with keepalive_cond:
-        keepalive_cond.value = True
-        keepalive_cond.notify_all()
-
-def h_player_list_item(plist_cond, packet):
-    with plist_cond:
-        packet.apply(plist_cond.list)
-
-def h_disconnect(connected_cond, packet):
-    msg = json_chat.decode_string(packet.json_data)
-    with connected_cond:
-        pfile = sys.stdout if connected_cond.connected else sys.stderr
-        fprint('Disconnected from server: %s' % msg, file=pfile)
-    thread.interrupt_main()
-
-def main_thread(connected_cond, conn):
+    client.start()
     try:
-        while conn.networking_thread.is_alive():
-            conn.networking_thread.join(0.1)
-        with connected_cond:
-            pfile = sys.stdout if connected_cond.connected else sys.stderr
-            reason = str(conn.exception) \
-                if hasattr(conn, 'exception') and conn.exception is not None \
-                else 'unknown error.'
-            fprint('Disconnected from server: %s' % reason, file=pfile)
-    except KeyboardInterrupt as e:
-        pass
+        while client.is_alive():
+            client.join(0.1)
+    except KeyboardInterrupt:
+        client.interrupt()
+        client.join(1)
 
-def timeout_thread(keepalive_cond, connected_cond):
-    while True:
-        start = time.clock()
-        with keepalive_cond:
-            keepalive_cond.value = False
-            keepalive_cond.wait(KEEPALIVE_TIMEOUT_S)
-            if not keepalive_cond.value: break
+class DisconnectReason(object): pass
+class StandbyDisconnect(DisconnectReason): pass
+class InterruptDisconnect(DisconnectReason): pass
 
-    with connected_cond:
-        pfile = sys.stdout if connected_cond.connected else sys.stderr
-        fprint('Disconnected from server: timed out (%ss).'
-            % KEEPALIVE_TIMEOUT_S, file=pfile)
+class PacketHandler(object):
+    def install(self, target):
+        for method, types in self.get_packet_handlers():
+            target.register_packet_listener(
+                functools.partial(method, self), *types)
 
-    thread.interrupt_main()
+    @classmethod
+    def get_packet_handlers(cls):
+        if not hasattr(cls, 'packet_handlers'):
+            cls.packet_handlers = []
+        return cls.packet_handlers        
 
-def query_thread(query_cond, host, port):
-    while True:
-        with query_cond:
-            query_cond.wait()
+    @classmethod
+    def handle(cls, *types):
+        def d_handle(method):
+            cls.get_packet_handlers().append((method, types))
+            return method
+        return d_handle
 
-        server = mcstatus.MinecraftServer(host, port)
-        try:
-            result = server.query()
-        except Exception as e:
-            result = e
+class Client(Thread, PacketHandler):
+    def __init__(
+        self, host, port=None, standby=False, plugins=None, *args, **kwds
+    ):
+        super(Client, self).__init__()
+        self.daemon = True
+        self.name = 'Client'
+        self.standby = standby
 
-        with query_cond:
-            for query in query_cond.set:
-                if isinstance(result, Exception):
-                    fprint('!query failure %s %s' % (query, result))
-                    continue
-                elif query == 'map':
-                    result = result.map
-                elif query == 'players':
-                    result = ' '.join(result.players.names)
-                fprint('!query success %s %s' % (query, result))
-            query_cond.set.clear()
+        self.query = Query(host=host, port=port)
 
-def make_query(query_cond, query):
-    with query_cond:
-        query_cond.set.add(query)
-        query_cond.notify_all()
+        plugins = (self,) + tuple(plugins or ())
+        self.connection = Connection(
+            host=host, port=port, plugins=plugins, *args, **kwds)
 
-def stdin_thread(conn, query_cond, plist_cond, connected_cond):
-    def send_chat(conn, text):
-        packet = packets.ChatPacket()
-        packet.message = text
-        conn.write_packet(packet)
-    while True:
-        text = raw_input().decode('utf8')        
-        match = re.match(r'\?query\s+(\S+)\s*$', text)
-        if match and match.group(1) == 'players':
-            with connected_cond:
-                if not connected_cond.connected:
-                    continue
-            with plist_cond:
-                players = ' '.join(
-                    json_chat.decode_string(p.display_name)
-                        if p.display_name else p.name
-                    for p in plist_cond.list.players_by_uuid.itervalues())
-            fprint('!query success players %s' % players)
-        elif match:
-            make_query(query_cond, match.group(1))
+        self.rlock = RLock()
+        self.exit_cond = Condition(self.rlock)
+        self.player_list_cond = Condition(self.rlock)
+        self.players = None
+        self.reported_joined_players = set()
+        self.reported_left_players = set()
+
+    def run(self):
+        if self.standby:
+            targets = (
+                self.run_standby_query,
+                self.run_standby_connect,
+                self.run_player_list)
         else:
-            while len(text) > 100:
-                send_chat(conn, text[:97] + '...')
-                text = '...' + text[97:]
-            if text:
-                send_chat(conn, text)
-    
-    query_cond.acquire()
-    sys.exit()
+            targets = (
+                self.run_direct,
+                self.run_player_list)
+
+        with self.rlock:
+            for target in targets:
+                thread = Thread(
+                    target=target, name='Client.'+target.__name__)
+                thread.daemon = True
+                thread.start()
+            self.exit_cond.wait()
+
+    def interrupt(self):
+        with self.rlock:
+            self.connection.ensure_disconnected(InterruptDisconnect())
+            self.exit_cond.notify_all()
+
+    def run_standby_connect(self):
+        with self.connection.rlock:
+            while True:
+                self.connection.disconnect_cond.wait()              
+                reason = self.connection.disconnect_reason
+
+                if isinstance(reason, StandbyDisconnect): continue
+                if isinstance(reason, InterruptDisconnect): break
+                fprint('Disconnected from server: %s' % reason)
+
+                with self.rlock:
+                    self.exit_cond.notify_all()
+                break
+
+    def run_standby_query(self):
+        while True:
+            try:
+                result = self.query.query()
+            except Exception as e:
+                traceback.print_exc()
+                with self.rlock:
+                    if self.players is not None:
+                        fprint('Failed to contact server: %s' % e)
+                    self.exit_cond.notify_all()
+                    return
+
+            new_players = set(result.players.names)
+            if new_players - {self.connection.profile_name}:
+                self.connection.ensure_connecting()
+            else:
+                with self.rlock:
+                    if self.players is None:
+                        fprint('Connected to server in standby mode.')
+                self.connection.ensure_disconnected(StandbyDisconnect())
+
+            with self.connection.rlock:
+                if not self.connection.disconnected:
+                    self.connection.disconnect_cond.wait()
+                    reason = self.connection.disconnect_reason
+                    if isinstance(reason, StandbyDisconnect):
+                        continue
+                    else:
+                        break                    
+
+            if not new_players or self.players is not None:
+                self.set_players(new_players)
+            time.sleep(STANDBY_QUERY_INTERVAL_S)
+
+    def run_direct(self):
+        with self.connection.rlock:
+            self.connection.connect()
+            self.connection.disconnect_cond.wait()
+            reason = self.connection.disconnect_reason
+        if isinstance(reason, InterruptDisconnect): return
+        with self.rlock:
+            if self.players is not None:
+                fprint('Disconnected from server: %s' % reason)
+            self.exit_cond.notify_all()
+
+    def run_player_list(self):
+        with self.rlock:
+            while True:
+                self.player_list_cond.wait()
+                clock = time.clock()
+                end = clock + 0.1
+                while clock < end:
+                    self.player_list_cond.wait(end - clock + 0.01)
+                    clock = time.clock()
+                self.update_player_list()
+
+    def update_player_list(self):
+        with self.connection.rlock:
+            if self.connection.player_list is None: return
+            new_players = set(
+                json_chat.decode_string(p.display_name)
+                if p.display_name else p.name for p in
+                self.connection.player_list.players_by_uuid.itervalues())
+            self.set_players(new_players)
+
+    def set_players(self, new_players):
+        with self.rlock:
+            with self.connection.rlock:
+                profile_name = self.connection.profile_name
+
+            if self.players is not None:
+                for added_player in new_players - self.players:
+                    if (added_player not in self.reported_joined_players
+                    and added_player != profile_name):
+                        fprint(json_chat.decode_struct({
+                            'translate': 'multiplayer.player.joined',
+                            'using': [added_player]}))
+                    self.reported_joined_players.add(added_player)
+                    self.reported_left_players.discard(added_player)
+                for removed_player in self.players - new_players:
+                    if (removed_player not in self.reported_left_players
+                    and removed_player != profile_name):
+                        fprint(json_chat.decode_struct({
+                            'translate': 'multiplayer.player.left',
+                            'using': [removed_player]}))        
+                    self.reported_left_players.add(removed_player)
+                    self.reported_joined_players.discard(removed_player)
+
+            if self.standby and not (new_players - {profile_name}):
+                self.connection.ensure_disconnected(StandbyDisconnect())
+
+            self.players = new_players
+
+@Client.handle(packets.JoinGamePacket)
+def h_join_game(self, packet):
+    with self.rlock:
+        if self.players is None:
+            fprint('Connected to server.')
+
+@Client.handle(packets.ChatMessagePacket)
+def h_chat_message(self, packet):
+    with self.rlock:
+        data = json.loads(packet.json_data)
+        using = data.get('using') or data.get('with')
+        omit_message = False
+
+        if data.get('translate') == 'multiplayer.player.joined':
+            player = json_chat.decode_struct(using[0])
+            if player in self.reported_joined_players:
+                omit_message = True
+            else:
+                self.reported_joined_players.add(player)
+                self.reported_left_players.discard(player)
+            new_players = self.players | {player}
+        elif data.get('translate') == 'multiplayer.player.left':
+            player = json_chat.decode_struct(using[0])
+            if player in self.reported_left_players:
+                omit_message = True
+            else:
+                self.reported_left_players.add(player)
+                self.reported_joined_players.discard(player)
+            new_players = self.players - {player}
+        else:
+            player = None
+            new_players = None
+
+        if not omit_message:
+            fprint(json_chat.decode_string(packet.json_data).encode('utf8'))
+
+        if new_players is not None:
+            self.set_players(new_players)
+
+@Client.handle(packets.PlayerListItemPacket)
+def h_player_list_item(self, packet):
+    with self.rlock:
+        self.player_list_cond.notify_all()
+
+class Connection(PacketHandler):
+    def __init__(
+        self, uname, pword, host, port=None, offline=False, plugins=None
+    ):
+        super(Connection, self).__init__()
+        self.uname = uname
+        self.pword = pword
+        self.host = host
+        self.port = port or DEFAULT_PORT
+        self.offline = offline
+        self.plugins = plugins
+
+        self.rlock = RLock()
+        self.connection = None
+        self.player_list = None
+        self.profile_name = None
+        self.disconnect_cond = Condition(self.rlock)
+        self.disconnect_reason = None
+        self.fully_connected = False
+        self.disconnected = True
+
+        self.auth_token = None
+
+    def ensure_connecting(self):
+        with self.rlock:
+            if self.disconnected:
+                self.connect()
+
+    def ensure_disconnected(self, reason=None):
+        with self.rlock:
+            if not self.disconnected:
+                self.disconnect(reason)
+
+    def connect(self):
+        with self.rlock:
+            assert self.disconnected
+            self.disconnected = False
+            self.profile_name = None
+
+        self.connection_thread = Thread(
+            target=self.run_connection, name='Connection.run_connection')
+        self.connection_thread.daemon = True
+        self.connection_thread.start()   
+        
+    def disconnect(self, reason=None):
+        with self.rlock:
+            assert not self.disconnected
+
+            if self.connection is not None:
+                self.connection.packet_listeners[:] = []
+                sock = self.connection.socket
+                if hasattr(sock, 'actual_socket'):
+                    sock = sock.actual_socket
+                sock.shutdown(socket.SHUT_RDWR)
+                sock.close()
+                self.connection = None
+
+            self.player_list = None
+            self.fully_connected = False
+            self.disconnected = True
+            self.connection_thread = None
+            self.disconnect_reason = reason
+            self.disconnect_cond.notify_all()
+
+    def run_connection(self):
+        try:
+            auth = self.authenticate()
+        except Exception as e:
+            traceback.print_exc()
+            return self.disconnect(e)
+
+        with self.rlock:
+            self.profile_name = auth.profile.name
+            conn = connection.Connection(self.host, self.port, auth)
+            for plugin in (self,) + tuple(self.plugins or ()):
+                plugin.install(conn)
+            self.connection = conn
+
+        try:
+            conn.connect()
+        except BaseException as e:
+            traceback.print_exc()
+            return self.disconnect(e)
+
+        conn.networking_thread.join()
+        with self.rlock:
+            if self.connection_thread is threading.current_thread():
+                reason = getattr(conn, 'exception', 'unknown error.')
+                if isinstance(reason, BaseException):
+                    traceback.print_exception(*reason.exc_info)
+                self.disconnect(reason)
+
+    def authenticate(self):
+        for i in range(AUTH_ATTEMPTS_MAX):
+            try:
+                return self._authenticate()
+            except YggdrasilError as e:
+                self.auth_token = None
+                if e.message == AUTH_RATE_LIMIT_MESSAGE:
+                    fprint('Authentication rate-limited; retrying in '
+                        '%s seconds (%d/%d).'
+                        % (AUTH_RETRY_DELAY_S, i+1, AUTH_ATTEMPTS_MAX),
+                        file=sys.stderr)
+                    time.sleep(AUTH_RETRY_DELAY_S)
+                else:
+                    raise
+        raise Exception(
+            'Authentication abandoned after being rate-limited %d times.'
+                % AUTH_ATTEMPTS_MAX)
+
+    def _authenticate(self):
+        with self.rlock:
+            if self.auth_token is None and self.offline:
+                self.auth_token = authentication.AuthenticationToken(
+                    '-', '-', '-')
+                self.auth_token.profile.id_ = '-'
+                self.auth_token.profile.name = self.uname
+                self.auth_token.join = lambda *a, **k: None
+
+            if self.auth_token is None and os.path.exists(AUTH_TOKEN_PATH):
+                try:
+                    with open(AUTH_TOKEN_PATH) as file:
+                        saved_token = json.load(file)
+                except Exception as e:
+                    traceback.print_exc()
+                    saved_token = None
+
+            if (self.auth_token is None and isinstance(saved_token, dict)
+            and saved_token.get('username' == self.uname)
+            and 'access_token' in saved_token and 'client_token' in saved_token):
+                self.auth_token = authentication.AuthenticationToken(
+                    access_token = saved_token['access_token'],
+                    client_token = saved_token['client_token'])
+                
+                if not self.auth_token.refresh():
+                    fprint('Warning: %s is not valid. Discarding.'
+                        % AUTH_TOKEN_PATH, file=sys.stderr)
+                    self.auth_token = None
+
+            if self.auth_token is None:
+                self.auth_token = authentication.AuthenticationToken()
+                self.auth_token.authenticate(self.uname, self.pword)
+
+            if not self.offline:
+                try:
+                    with open(AUTH_TOKEN_PATH, 'w') as file:
+                        json.dump({
+                            'username':     self.uname,
+                            'access_token': self.auth_token.access_token,
+                            'client_token': self.auth_token.client_token
+                        }, file)
+                except IOError as e:
+                    traceback.print_exc()
+
+            return self.auth_token
+
+@Connection.handle(packets.JoinGamePacket)
+def h_join_game(self, packet):
+    with self.rlock:
+        self.fully_connected = True
+
+@Connection.handle(packets.PlayerListItemPacket)
+def h_player_list_item(self, packet):
+    with self.rlock:
+        if self.player_list is None:
+            self.player_list = packets.PlayerListItemPacket.PlayerList()
+        packet.apply(self.player_list)
+
+@Connection.handle(packets.KeepAlivePacket)
+def h_keep_alive(self, packet):
+    pass
+
+@Connection.handle(packets.DisconnectPacket)
+def h_disconnect(self, packet):
+    reason = json_chat.decode_string(packet.json_data)
+    self.ensure_disconnect(reason)
+
+class Query(object):
+    def __init__(self, host, port=DEFAULT_PORT):
+        self.rlock = RLock()
+        self.server = mcstatus.MinecraftServer(host, port or DEFAULT_PORT)
+        self.complete_cond = Condition(self.rlock)
+        self.pending = False
+        self.result = None
+
+    def query(self):
+        with self.rlock:
+            if not self.pending:
+                thread = Thread(target=self.start_query, name='Query')
+                thread.daemon = True
+                thread.start()
+            self.complete_cond.wait()
+            if isinstance(self.result, Exception):
+                ty, ex, tb = self.result.exc_info
+                raise ty, ex, tb
+            else:
+                return self.result
+
+    def start_query(self):
+        with self.rlock:
+            self.pending = True
+        try:
+            result = self.server.query()
+        except Exception as e:
+            e.exc_info = sys.exc_info()
+            result = e
+        with self.rlock:
+            self.result = result
+            self.pending = False
+            self.complete_cond.notify_all()
 
 def fprint(*args, **kwds):
     print(*args, **kwds)

@@ -6,9 +6,11 @@ import sys
 from mcmapimg import mcmapimg
 from minecraft.networking.packets import MapPacket
 
-map_set = MapPacket.MapSet()
+map_set = None
 
 def install(conn):
+    global map_set
+    map_set = MapPacket.MapSet()
     conn.register_packet_listener(h_map, MapPacket)
 
 def h_map(packet):
