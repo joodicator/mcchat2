@@ -28,7 +28,7 @@ import json_chat
 DEFAULT_PORT = 25565
 
 KEEPALIVE_TIMEOUT_S = 30
-STANDBY_QUERY_INTERVAL_S = 1
+STANDBY_QUERY_INTERVAL_S = 5
 
 AUTH_TOKEN_PATH = os.path.join(
     os.path.dirname(__file__), 'var', 'authentication_token')
@@ -121,15 +121,19 @@ class Client(Thread, PacketHandler):
         self.reported_left_players = set()
 
     def run(self):
+        targets = (
+            self.run_player_list,
+            self.run_read_input,
+        )
         if self.standby:
             targets = (
                 self.run_standby_query,
                 self.run_standby_connect,
-                self.run_player_list)
+            ) + targets
         else:
             targets = (
                 self.run_direct,
-                self.run_player_list)
+            ) + targets
 
         with self.rlock:
             for target in targets:
@@ -137,12 +141,53 @@ class Client(Thread, PacketHandler):
                     target=target, name='Client.'+target.__name__)
                 thread.daemon = True
                 thread.start()
+
+            self.serve_query('map')
             self.exit_cond.wait()
 
     def interrupt(self):
         with self.rlock:
             self.connection.ensure_disconnected(InterruptDisconnect())
             self.exit_cond.notify_all()
+
+    def run_read_input(self):
+        while True:
+            text = raw_input().decode('utf8')
+            match = re.match(r'\?query\s+(\S+)\s*$', text)
+            if match:
+                self.serve_query(match.group(1))
+            else:
+                self.connection.chat(text)
+
+    def serve_query(self, query):
+        def h_result(success, result):
+            with self.rlock:
+                fprint('!query %s %s %s' % (
+                    'success' if success else 'failure', query, result))
+        if query == 'players':
+            with self.rlock:
+                if self.players is not None:
+                    h_result(True, ' '.join(sorted(self.players)))
+                else:
+                    h_result(True, '')
+        elif query == 'agent':
+            with self.connection.rlock:
+                if self.connection.profile_name is not None:
+                    h_result(True, self.connection.profile_name)
+                else:
+                    h_result(False, 'unknown')
+        else:
+            self._serve_query(query, h_result)
+
+    def _serve_query(self, query, h_result):
+        def _h_result(success, result):
+            if not success:
+                h_result(False, result)
+            elif query not in result.raw:
+                h_result(False, '"%s" not present in query response.' % query)
+            else:
+                h_result(True, result.raw[query])
+        self.query.query_async(_h_result)
 
     def run_standby_connect(self):
         with self.connection.rlock:
@@ -160,6 +205,8 @@ class Client(Thread, PacketHandler):
 
     def run_standby_query(self):
         while True:
+            time.sleep(STANDBY_QUERY_INTERVAL_S)
+
             try:
                 result = self.query.query()
             except Exception as e:
@@ -190,7 +237,6 @@ class Client(Thread, PacketHandler):
 
             if not new_players or self.players is not None:
                 self.set_players(new_players)
-            time.sleep(STANDBY_QUERY_INTERVAL_S)
 
     def run_direct(self):
         with self.connection.rlock:
@@ -284,8 +330,14 @@ def h_chat_message(self, packet):
             player = None
             new_players = None
 
-        if not omit_message:
-            fprint(json_chat.decode_string(packet.json_data).encode('utf8'))
+        if data.get('translate').startswith('chat.type.'):
+            with self.connection.rlock:
+                player = json_chat.decode_struct(using[0])
+                if player == self.connection.profile_name:
+                    omit_message = True
+
+        fprint(json_chat.decode_string(packet.json_data).encode('utf8'),
+            file=sys.stderr if omit_message else sys.stdout)
 
         if new_players is not None:
             self.set_players(new_players)
@@ -334,10 +386,10 @@ class Connection(PacketHandler):
             self.disconnected = False
             self.profile_name = None
 
-        self.connection_thread = Thread(
+        thread = Thread(
             target=self.run_connection, name='Connection.run_connection')
-        self.connection_thread.daemon = True
-        self.connection_thread.start()   
+        thread.daemon = True
+        thread.start()   
         
     def disconnect(self, reason=None):
         with self.rlock:
@@ -355,9 +407,25 @@ class Connection(PacketHandler):
             self.player_list = None
             self.fully_connected = False
             self.disconnected = True
-            self.connection_thread = None
             self.disconnect_reason = reason
             self.disconnect_cond.notify_all()
+
+    def chat(self, text):
+        with self.rlock:
+            if self.fully_connected:
+                while len(text) > 100:
+                    self._chat(text[:97] + '...')
+                    text = '...' + text[97:]
+                if text:
+                    self._chat(text)
+            else:
+                fprint('Warning: message not sent, as not connected to server.',
+                    file=sys.stderr)
+
+    def _chat(self, text):
+        packet = packets.ChatPacket()
+        packet.message = text
+        self.connection.write_packet(packet)
 
     def run_connection(self):
         try:
@@ -372,6 +440,7 @@ class Connection(PacketHandler):
             for plugin in (self,) + tuple(self.plugins or ()):
                 plugin.install(conn)
             self.connection = conn
+            self.keep_alive = True
 
         try:
             conn.connect()
@@ -379,9 +448,17 @@ class Connection(PacketHandler):
             traceback.print_exc()
             return self.disconnect(e)
 
-        conn.networking_thread.join()
+        while conn.networking_thread.is_alive():
+            with self.rlock:
+                if not self.keep_alive:
+                    if conn is self.connection:
+                        self.disconnect('timed out (%ss).' % KEEPALIVE_TIMEOUT_S)
+                    return
+                self.keep_alive = False
+            conn.networking_thread.join(KEEPALIVE_TIMEOUT_S)
+
         with self.rlock:
-            if self.connection_thread is threading.current_thread():
+            if conn is self.connection:
                 reason = getattr(conn, 'exception', 'unknown error.')
                 if isinstance(reason, BaseException):
                     traceback.print_exception(*reason.exc_info)
@@ -465,7 +542,8 @@ def h_player_list_item(self, packet):
 
 @Connection.handle(packets.KeepAlivePacket)
 def h_keep_alive(self, packet):
-    pass
+    with self.rlock:
+        self.keep_alive = True
 
 @Connection.handle(packets.DisconnectPacket)
 def h_disconnect(self, packet):
@@ -479,13 +557,11 @@ class Query(object):
         self.complete_cond = Condition(self.rlock)
         self.pending = False
         self.result = None
+        self.waiting = []
 
     def query(self):
         with self.rlock:
-            if not self.pending:
-                thread = Thread(target=self.start_query, name='Query')
-                thread.daemon = True
-                thread.start()
+            self.start_query_async()
             self.complete_cond.wait()
             if isinstance(self.result, Exception):
                 ty, ex, tb = self.result.exc_info
@@ -493,18 +569,35 @@ class Query(object):
             else:
                 return self.result
 
+    def query_async(self, h_result):
+        with self.rlock:
+            self.waiting.append(h_result)
+            self.start_query_async()
+
+    def start_query_async(self):
+        with self.rlock:
+            if not self.pending:
+                thread = Thread(target=self.start_query, name='Query')
+                thread.daemon = True
+                thread.start()
+
     def start_query(self):
         with self.rlock:
             self.pending = True
         try:
             result = self.server.query()
+            success = True
         except Exception as e:
             e.exc_info = sys.exc_info()
             result = e
+            success = False
         with self.rlock:
             self.result = result
             self.pending = False
             self.complete_cond.notify_all()
+            for h_result in self.waiting:
+                h_result(success, result)
+            del self.waiting[:]
 
 def fprint(*args, **kwds):
     print(*args, **kwds)
