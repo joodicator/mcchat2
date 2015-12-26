@@ -29,9 +29,9 @@ DEFAULT_PORT = 25565
 
 KEEPALIVE_TIMEOUT_S = 30
 STANDBY_QUERY_INTERVAL_S = 5
+QUERY_TIMEOUT_S = 20
+QUERY_ATTEMPTS = 10
 
-AUTH_TOKEN_PATH = os.path.join(
-    os.path.dirname(__file__), 'var', 'authentication_token')
 AUTH_RATE_LIMIT_MESSAGE = "[403] ForbiddenOperationException: 'Invalid credentials.'"
 AUTH_ATTEMPTS_MAX = 6
 AUTH_RETRY_DELAY_S = 10
@@ -169,13 +169,13 @@ class Client(Thread, PacketHandler):
                 if self.players is not None:
                     h_result(True, ' '.join(sorted(self.players)))
                 else:
-                    h_result(True, '')
+                    h_result(False, 'No contact with server.')
         elif query == 'agent':
             with self.connection.rlock:
                 if self.connection.profile_name is not None:
                     h_result(True, self.connection.profile_name)
                 else:
-                    h_result(False, 'unknown')
+                    h_result(False, 'Unknown')
         else:
             self._serve_query(query, h_result)
 
@@ -197,7 +197,8 @@ class Client(Thread, PacketHandler):
 
                 if isinstance(reason, StandbyDisconnect): continue
                 if isinstance(reason, InterruptDisconnect): break
-                fprint('Disconnected from server: %s' % reason)
+                if self.players is not None:
+                    fprint('Disconnected from server: %s' % reason)
 
                 with self.rlock:
                     self.exit_cond.notify_all()
@@ -452,14 +453,14 @@ class Connection(PacketHandler):
             with self.rlock:
                 if not self.keep_alive:
                     if conn is self.connection:
-                        self.disconnect('timed out (%ss).' % KEEPALIVE_TIMEOUT_S)
+                        self.disconnect('Timed out (%ss).' % KEEPALIVE_TIMEOUT_S)
                     return
                 self.keep_alive = False
             conn.networking_thread.join(KEEPALIVE_TIMEOUT_S)
 
         with self.rlock:
             if conn is self.connection:
-                reason = getattr(conn, 'exception', 'unknown error.')
+                reason = getattr(conn, 'exception', 'Unknown error.')
                 if isinstance(reason, BaseException):
                     traceback.print_exception(*reason.exc_info)
                 self.disconnect(reason)
@@ -490,42 +491,9 @@ class Connection(PacketHandler):
                 self.auth_token.profile.id_ = '-'
                 self.auth_token.profile.name = self.uname
                 self.auth_token.join = lambda *a, **k: None
-
-            if self.auth_token is None and os.path.exists(AUTH_TOKEN_PATH):
-                try:
-                    with open(AUTH_TOKEN_PATH) as file:
-                        saved_token = json.load(file)
-                except Exception as e:
-                    traceback.print_exc()
-                    saved_token = None
-
-            if (self.auth_token is None and isinstance(saved_token, dict)
-            and saved_token.get('username' == self.uname)
-            and 'access_token' in saved_token and 'client_token' in saved_token):
-                self.auth_token = authentication.AuthenticationToken(
-                    access_token = saved_token['access_token'],
-                    client_token = saved_token['client_token'])
-                
-                if not self.auth_token.refresh():
-                    fprint('Warning: %s is not valid. Discarding.'
-                        % AUTH_TOKEN_PATH, file=sys.stderr)
-                    self.auth_token = None
-
-            if self.auth_token is None:
+            elif self.auth_token is None:
                 self.auth_token = authentication.AuthenticationToken()
                 self.auth_token.authenticate(self.uname, self.pword)
-
-            if not self.offline:
-                try:
-                    with open(AUTH_TOKEN_PATH, 'w') as file:
-                        json.dump({
-                            'username':     self.uname,
-                            'access_token': self.auth_token.access_token,
-                            'client_token': self.auth_token.client_token
-                        }, file)
-                except IOError as e:
-                    traceback.print_exc()
-
             return self.auth_token
 
 @Connection.handle(packets.JoinGamePacket)
@@ -585,8 +553,13 @@ class Query(object):
         with self.rlock:
             self.pending = True
         try:
-            result = self.server.query()
-            success = True
+            try:
+                result = self.server.query(
+                    retries=QUERY_ATTEMPTS, timeout=QUERY_TIMEOUT_S)
+                success = True
+            except socket.timeout:
+                raise Exception('Timed out (%ss, %s attempts).' % (
+                    QUERY_TIMEOUT_S, QUERY_ATTEMPTS))
         except Exception as e:
             e.exc_info = sys.exc_info()
             result = e
