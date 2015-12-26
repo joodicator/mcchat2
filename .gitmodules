@@ -1,0 +1,7 @@
+[submodule "mcstatus"]
+path = lib/mcstatus
+url = https://github.com/joodicator/mcstatus
+
+[submodule "pyCraft"]
+path = lib/pyCraft
+url = https://github.com/joodicator/pyCraft
