@@ -43,6 +43,7 @@ def main():
     parser.add_argument('pword', metavar='PASSWORD', nargs='?')
     parser.add_argument('--offline', dest='offline', action='store_true')
     parser.add_argument('--standby', dest='standby', action='store_true')
+    parser.add_argument('--protocol', dest='version', metavar='VERSION')
     parser.add_argument('--plugins', dest='plugins', metavar='NAME', nargs='+')
     args = parser.parse_args()
 
@@ -63,9 +64,14 @@ def main():
         file, path, desc = imp.find_module(plugin, ['plugins'])
         plugins.append(imp.load_module(plugin, file, path, desc))
 
+    try: version = int(args.version)
+    except ValueError: version = args.version
+    except TypeError: version = args.version
+
     client = Client(
         uname=args.uname, pword=pword, host=host, port=port,
-        offline=offline, standby=args.standby, plugins=plugins)
+        offline=offline, standby=args.standby, version=version,
+        plugins=plugins)
 
     client.start()
     try:
@@ -197,8 +203,8 @@ class Client(Thread, PacketHandler):
 
                 if isinstance(reason, StandbyDisconnect): continue
                 if isinstance(reason, InterruptDisconnect): break
-                if self.players is not None:
-                    fprint('Disconnected from server: %s' % reason)
+                fprint('Disconnected from server: %s' % reason,
+                    file=sys.stderr if self.players is None else sys.stdout)
 
                 with self.rlock:
                     self.exit_cond.notify_all()
@@ -246,8 +252,8 @@ class Client(Thread, PacketHandler):
             reason = self.connection.disconnect_reason
         if isinstance(reason, InterruptDisconnect): return
         with self.rlock:
-            if self.players is not None:
-                fprint('Disconnected from server: %s' % reason)
+            fprint('Disconnected from server: %s' % reason,
+                file=sys.stderr if self.players is None else sys.stdout)
             self.exit_cond.notify_all()
 
     def run_player_list(self):
@@ -350,7 +356,8 @@ def h_player_list_item(self, packet):
 
 class Connection(PacketHandler):
     def __init__(
-        self, uname, pword, host, port=None, offline=False, plugins=None
+        self, uname, pword, host,
+        port=None, offline=False, version=None, plugins=None
     ):
         super(Connection, self).__init__()
         self.uname = uname
@@ -358,6 +365,7 @@ class Connection(PacketHandler):
         self.host = host
         self.port = port or DEFAULT_PORT
         self.offline = offline
+        self.version = version
         self.plugins = plugins
 
         self.rlock = RLock()
@@ -437,7 +445,8 @@ class Connection(PacketHandler):
 
         with self.rlock:
             self.profile_name = auth.profile.name
-            conn = connection.Connection(self.host, self.port, auth)
+            conn = connection.Connection(
+                self.host, self.port, auth, initial_version=self.version)
             for plugin in (self,) + tuple(self.plugins or ()):
                 plugin.install(conn)
             self.connection = conn
@@ -496,6 +505,11 @@ class Connection(PacketHandler):
                 self.auth_token.authenticate(self.uname, self.pword)
             return self.auth_token
 
+@Connection.handle(packets.LoginSuccessPacket)
+def h_login_success(self, packet):
+    with self.rlock:
+        self.version = packet.context.protocol_version
+
 @Connection.handle(packets.JoinGamePacket)
 def h_join_game(self, packet):
     with self.rlock:
@@ -516,7 +530,7 @@ def h_keep_alive(self, packet):
 @Connection.handle(packets.DisconnectPacket)
 def h_disconnect(self, packet):
     reason = json_chat.decode_string(packet.json_data)
-    self.ensure_disconnect(reason)
+    self.ensure_disconnected(reason)
 
 class Query(object):
     def __init__(self, host, port=DEFAULT_PORT):
