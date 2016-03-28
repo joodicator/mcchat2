@@ -27,10 +27,12 @@ import json_chat
 
 DEFAULT_PORT = 25565
 
-KEEPALIVE_TIMEOUT_S = 30
-STANDBY_QUERY_INTERVAL_S = 5
-QUERY_TIMEOUT_S = 20
-QUERY_ATTEMPTS = 10
+KEEPALIVE_TIMEOUT_S        = 30
+STANDBY_QUERY_INTERVAL_S   = 5
+PREVENT_TIMEOUT_INTERVAL_S = 60
+QUERY_TIMEOUT_S            = 20
+QUERY_ATTEMPTS             = 10
+RECONNECT_DELAY_S          = 5
 
 AUTH_RATE_LIMIT_MESSAGE = "[403] ForbiddenOperationException: 'Invalid credentials.'"
 AUTH_ATTEMPTS_MAX = 6
@@ -45,6 +47,8 @@ def main():
     parser.add_argument('--standby', dest='standby', action='store_true')
     parser.add_argument('--protocol', dest='version', metavar='VERSION')
     parser.add_argument('--plugins', dest='plugins', metavar='NAME', nargs='+')
+    parser.add_argument('--prevent-idle-timeout',
+        dest='prevent_timeout', action='store_true')
     args = parser.parse_args()
 
     host, port = (
@@ -71,7 +75,7 @@ def main():
     client = Client(
         uname=args.uname, pword=pword, host=host, port=port,
         offline=offline, standby=args.standby, version=version,
-        plugins=plugins)
+        prevent_timeout=args.prevent_timeout, plugins=plugins)
 
     client.start()
     try:
@@ -113,7 +117,9 @@ class Client(Thread, PacketHandler):
         self.name = 'Client'
         self.standby = standby
 
-        self.query = Query(host=host, port=port)
+        self.gamespy_query = GameSpyQuery(host=host, port=port)
+        if self.standby:
+            self.status_query = StatusQuery(host=host, port=port)
 
         plugins = (self,) + tuple(plugins or ())
         self.connection = Connection(
@@ -125,6 +131,8 @@ class Client(Thread, PacketHandler):
         self.players = None
         self.reported_joined_players = set()
         self.reported_left_players = set()
+        self.reconnecting = False
+        self.connecting = True
 
     def run(self):
         targets = (
@@ -133,8 +141,7 @@ class Client(Thread, PacketHandler):
         )
         if self.standby:
             targets = (
-                self.run_standby_query,
-                self.run_standby_connect,
+                self.run_standby,
             ) + targets
         else:
             targets = (
@@ -193,78 +200,82 @@ class Client(Thread, PacketHandler):
                 h_result(False, '"%s" not present in query response.' % query)
             else:
                 h_result(True, result.raw[query])
-        self.query.query_async(_h_result)
+        self.gamespy_query.query_async(_h_result)
 
-    def run_standby_connect(self):
-        with self.connection.rlock:
-            while True:
-                self.connection.disconnect_cond.wait()              
-                reason = self.connection.disconnect_reason
-
-                if isinstance(reason, StandbyDisconnect): continue
-                if isinstance(reason, InterruptDisconnect): break
-                fprint('Disconnected from server: %s' % reason,
-                    file=sys.stderr if self.players is None else sys.stdout)
-
-                with self.rlock:
-                    self.exit_cond.notify_all()
-                break
-
-    def run_standby_query(self):
+    def run_standby(self):
+        fprint('Connecting in standby mode...',
+            file=sys.stderr)
         while True:
-            time.sleep(STANDBY_QUERY_INTERVAL_S)
-
             try:
-                result = self.query.query()
+                result = self.status_query.query()
             except Exception as e:
                 traceback.print_exc()
                 with self.rlock:
-                    if self.players is not None:
-                        fprint('Failed to contact server: %s' % e)
-                    self.exit_cond.notify_all()
-                    return
+                    fprint('Failed to contact server: %s' % e,
+                        file = sys.stderr if self.reconnecting else sys.stdout)
+                    self.players = None
+                    self.connecting = True
+                    self.reconnecting = True
+                    time.sleep(RECONNECT_DELAY_S)
+                    continue
 
-            new_players = set(result.players.names)
-            if new_players - {self.connection.profile_name}:
-                self.connection.ensure_connecting()
+            sample_players = { p.name for p in result.players.sample or [] }
+            if not (sample_players - {self.connection.profile_name}):
+                with self.rlock:
+                    if self.connecting:
+                        fprint('Connected to server in standby mode.')
+                        self.connecting = False
+                        self.reconnecting = False
+                self.set_players(sample_players)
+                time.sleep(STANDBY_QUERY_INTERVAL_S)
+                continue
+
+            self.connection.connect()
+            with self.connection.rlock:
+                self.connection.disconnect_cond.wait()
+                reason = self.connection.disconnect_reason
+
+            if isinstance(reason, StandbyDisconnect):
+                time.sleep(STANDBY_QUERY_INTERVAL_S)
             else:
                 with self.rlock:
-                    if self.players is None:
-                        fprint('Connected to server in standby mode.')
-                self.connection.ensure_disconnected(StandbyDisconnect())
-
-            with self.connection.rlock:
-                if not self.connection.disconnected:
-                    self.connection.disconnect_cond.wait()
-                    reason = self.connection.disconnect_reason
-                    if isinstance(reason, StandbyDisconnect):
-                        continue
-                    else:
-                        break                    
-
-            if not new_players or self.players is not None:
-                self.set_players(new_players)
+                    if not isinstance(reason, InterruptDisconnect):
+                        message = 'Failed to connect to server' if self.connecting \
+                             else 'Disconnected from server'
+                        print('%s: %s' % (message, reason),
+                            file=sys.stderr if self.reconnecting else sys.stdout)
+                    self.players = None
+                    self.connecting = True
+                    self.reconnecting = True
+                time.sleep(RECONNECT_DELAY_S)
 
     def run_direct(self):
-        with self.connection.rlock:
-            self.connection.connect()
-            self.connection.disconnect_cond.wait()
-            reason = self.connection.disconnect_reason
-        if isinstance(reason, InterruptDisconnect): return
-        with self.rlock:
-            fprint('Disconnected from server: %s' % reason,
-                file=sys.stderr if self.players is None else sys.stdout)
-            self.exit_cond.notify_all()
+        fprint('Connecting...', file=sys.stderr)
+        while True:
+            with self.connection.rlock:
+                self.connection.connect()
+                self.connection.disconnect_cond.wait()
+                reason = self.connection.disconnect_reason
+            if isinstance(reason, InterruptDisconnect):
+                break
+            with self.rlock:
+                message = 'Failed to connect to server' if self.connecting \
+                     else 'Disconnected from server'
+                fprint('%s: %s' % (message, reason),
+                    file=sys.stderr if self.reconnecting else sys.stdout)
+                self.reconnecting = True
+                self.connecting = True
+            time.sleep(RECONNECT_DELAY_S)
 
     def run_player_list(self):
         with self.rlock:
             while True:
                 self.player_list_cond.wait()
-                clock = time.clock()
+                clock = time.time()
                 end = clock + 0.1
                 while clock < end:
                     self.player_list_cond.wait(end - clock + 0.01)
-                    clock = time.clock()
+                    clock = time.time()
                 self.update_player_list()
 
     def update_player_list(self):
@@ -274,6 +285,9 @@ class Client(Thread, PacketHandler):
                 json_chat.decode_string(p.display_name)
                 if p.display_name else p.name for p in
                 self.connection.player_list.players_by_uuid.itervalues())
+        with self.rlock:
+            if self.players is None:
+                self.list_players(new_players)
             self.set_players(new_players)
 
     def set_players(self, new_players):
@@ -304,11 +318,21 @@ class Client(Thread, PacketHandler):
 
             self.players = new_players
 
+    def list_players(self, players):
+        players_str = ', '.join(sorted(players)) if players else '(none)'
+        with self.rlock:
+            fprint('Players online: %s.' % players_str)
+
 @Client.handle(packets.JoinGamePacket)
 def h_join_game(self, packet):
     with self.rlock:
-        if self.players is None:
+        if self.connecting:
             fprint('Connected to server.')
+            if self.players is not None:
+                self.list_players(self.players)
+        self.connecting = False
+        self.reconnecting = False
+    self.serve_query('agent')
 
 @Client.handle(packets.ChatMessagePacket)
 def h_chat_message(self, packet):
@@ -356,8 +380,8 @@ def h_player_list_item(self, packet):
 
 class Connection(PacketHandler):
     def __init__(
-        self, uname, pword, host,
-        port=None, offline=False, version=None, plugins=None
+        self, uname, pword, host, port=None, offline=False, version=None,
+        prevent_timeout=False, plugins=None
     ):
         super(Connection, self).__init__()
         self.uname = uname
@@ -366,6 +390,7 @@ class Connection(PacketHandler):
         self.port = port or DEFAULT_PORT
         self.offline = offline
         self.version = version
+        self.prevent_timeout = prevent_timeout
         self.plugins = plugins
 
         self.rlock = RLock()
@@ -375,6 +400,7 @@ class Connection(PacketHandler):
         self.disconnect_cond = Condition(self.rlock)
         self.disconnect_reason = None
         self.fully_connected = False
+        self.position = None
         self.disconnected = True
 
         self.auth_token = None
@@ -398,8 +424,8 @@ class Connection(PacketHandler):
         thread = Thread(
             target=self.run_connection, name='Connection.run_connection')
         thread.daemon = True
-        thread.start()   
-        
+        thread.start()
+
     def disconnect(self, reason=None):
         with self.rlock:
             assert not self.disconnected
@@ -409,12 +435,15 @@ class Connection(PacketHandler):
                 sock = self.connection.socket
                 if hasattr(sock, 'actual_socket'):
                     sock = sock.actual_socket
-                sock.shutdown(socket.SHUT_RDWR)
-                sock.close()
+                try: sock.shutdown(socket.SHUT_RDWR)
+                except IOError: pass
+                try: sock.close()
+                except IOError: pass
                 self.connection = None
 
             self.player_list = None
             self.fully_connected = False
+            self.position = None
             self.disconnected = True
             self.disconnect_reason = reason
             self.disconnect_cond.notify_all()
@@ -458,6 +487,13 @@ class Connection(PacketHandler):
             traceback.print_exc()
             return self.disconnect(e)
 
+        if self.prevent_timeout:
+            thread = Thread(
+                target = self.run_prevent_timeout,
+                name   = 'Connection.run_prevent_timeout')
+            thread.daemon = True
+            thread.start()
+
         while conn.networking_thread.is_alive():
             with self.rlock:
                 if not self.keep_alive:
@@ -473,6 +509,15 @@ class Connection(PacketHandler):
                 if isinstance(reason, BaseException):
                     traceback.print_exception(*reason.exc_info)
                 self.disconnect(reason)
+
+    def run_prevent_timeout(self):
+        with self.rlock:
+            while True:
+                self.disconnect_cond.wait(PREVENT_TIMEOUT_INTERVAL_S)
+                if self.disconnected: break
+                packet = packets.AnimationPacketServerbound(
+                    hand = packets.AnimationPacketServerbound.HAND_MAIN)
+                self.connection.write_packet(packet)
 
     def authenticate(self):
         for i in range(AUTH_ATTEMPTS_MAX):
@@ -527,12 +572,19 @@ def h_keep_alive(self, packet):
     with self.rlock:
         self.keep_alive = True
 
-@Connection.handle(packets.DisconnectPacket)
+@Connection.handle(packets.DisconnectPacket, packets.DisconnectPacketPlayState)
 def h_disconnect(self, packet):
     reason = json_chat.decode_string(packet.json_data)
     self.ensure_disconnected(reason)
 
-class Query(object):
+@Connection.handle(packets.PlayerPositionAndLookPacket)
+def h_player_position_and_look(self, packet):
+    if self.position is None:
+        self.position = packets.PlayerPositionAndLookPacket.PositionAndLook(
+            x=0, y=0, z=0, yaw=0, pitch=0)
+    packet.apply(self.position)
+
+class AbstractQuery(object):
     def __init__(self, host, port=DEFAULT_PORT):
         self.rlock = RLock()
         self.server = mcstatus.MinecraftServer(host, port or DEFAULT_PORT)
@@ -568,8 +620,7 @@ class Query(object):
             self.pending = True
         try:
             try:
-                result = self.server.query(
-                    retries=QUERY_ATTEMPTS, timeout=QUERY_TIMEOUT_S)
+                result = self.raw_query()
                 success = True
             except socket.timeout:
                 raise Exception('Timed out (%ss, %s attempts).' % (
@@ -585,6 +636,19 @@ class Query(object):
             for h_result in self.waiting:
                 h_result(success, result)
             del self.waiting[:]
+
+    def raw_query(self):
+        raise NotImplementedError('Must be overridden by a base class.')
+
+class GameSpyQuery(AbstractQuery):
+    def raw_query(self):
+        return self.server.query(
+            retries=QUERY_ATTEMPTS, timeout=QUERY_TIMEOUT_S)
+
+class StatusQuery(AbstractQuery):
+    def raw_query(self):
+        return self.server.status(
+            retries=QUERY_ATTEMPTS, timeout=QUERY_TIMEOUT_S)
 
 def fprint(*args, **kwds):
     print(*args, **kwds)

@@ -65,7 +65,8 @@ def translate(id, params):
                 'Too few arguments for "%s" in %s.'
                 % (language[id], params))
             param = ord_params.pop(0)
-        return ('%' + match.group('rest')) % param
+        rest = match.group('rest')
+        return ('%' + rest) % (int(param) if rest == 'd' else param)
 
     return re.sub(
         r'%((?P<index>\d+)\$)?(?P<rest>(\.\d+)?[a-zA-Z%])',
