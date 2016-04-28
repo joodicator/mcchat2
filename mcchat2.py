@@ -30,8 +30,8 @@ DEFAULT_PORT = 25565
 KEEPALIVE_TIMEOUT_S        = 30
 STANDBY_QUERY_INTERVAL_S   = 5
 PREVENT_TIMEOUT_INTERVAL_S = 60
-QUERY_TIMEOUT_S            = 20
-QUERY_ATTEMPTS             = 10
+QUERY_TIMEOUT_S            = 30
+QUERY_ATTEMPTS             = 5
 RECONNECT_DELAY_S          = 5
 
 AUTH_RATE_LIMIT_MESSAGE = "[403] ForbiddenOperationException: 'Invalid credentials.'"
@@ -223,7 +223,8 @@ class Client(Thread, PacketHandler):
             if not (sample_players - {self.connection.profile_name}):
                 with self.rlock:
                     if self.connecting:
-                        fprint('Connected to server in standby mode.')
+                        fprint('Connected to server in standby mode.',
+                            file = sys.stdout if self.reconnecting else sys.stderr)
                         self.connecting = False
                         self.reconnecting = False
                 self.set_players(sample_players)
@@ -242,7 +243,7 @@ class Client(Thread, PacketHandler):
                     if not isinstance(reason, InterruptDisconnect):
                         message = 'Failed to connect to server' if self.connecting \
                              else 'Disconnected from server'
-                        print('%s: %s' % (message, reason),
+                        fprint('%s: %s' % (message, reason),
                             file=sys.stderr if self.reconnecting else sys.stdout)
                     self.players = None
                     self.connecting = True
@@ -548,6 +549,8 @@ class Connection(PacketHandler):
             elif self.auth_token is None:
                 self.auth_token = authentication.AuthenticationToken()
                 self.auth_token.authenticate(self.uname, self.pword)
+            elif not self.offline:
+                self.auth_token.refresh()
             return self.auth_token
 
 @Connection.handle(packets.LoginSuccessPacket)
