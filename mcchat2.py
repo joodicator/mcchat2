@@ -16,6 +16,8 @@ import json
 import imp
 import traceback
 import functools
+import itertools
+import errno
 
 import minecraft.authentication as authentication
 import minecraft.networking.connection as connection
@@ -30,9 +32,11 @@ DEFAULT_PORT = 25565
 KEEPALIVE_TIMEOUT_S        = 30
 STANDBY_QUERY_INTERVAL_S   = 5
 PREVENT_TIMEOUT_INTERVAL_S = 60
-QUERY_TIMEOUT_S            = 30
-QUERY_ATTEMPTS             = 5
 RECONNECT_DELAY_S          = 5
+
+QUERY_ATTEMPTS         = 10
+QUERY_TIMEOUT_S        = 60
+QUERY_RETRY_INTERVAL_S = 15
 
 AUTH_RATE_LIMIT_MESSAGE = "[403] ForbiddenOperationException: 'Invalid credentials.'"
 AUTH_ATTEMPTS_MAX = 6
@@ -622,12 +626,24 @@ class AbstractQuery(object):
         with self.rlock:
             self.pending = True
         try:
-            try:
-                result = self.raw_query()
-                success = True
-            except socket.timeout:
-                raise Exception('Timed out (%ss, %s attempts).' % (
-                    QUERY_TIMEOUT_S, QUERY_ATTEMPTS))
+            for tries in itertools.count(1):
+                try:
+                    result = self.raw_query()
+                    success = True
+                    break
+                except Exception as e:
+                    timed_out = (isinstance(e, socket.error)
+                        and e.errno == errno.ETIMEDOUT)
+                    if tries < QUERY_ATTEMPTS:
+                        fprint('[Query %d/%d] %s' % (
+                            tries, QUERY_ATTEMPTS, e), file=sys.stderr)
+                        #if not timed_out:
+                        #    time.sleep(QUERY_RETRY_INTERVAL_S)
+                    elif timed_out:
+                        raise Exception('Timed out (%ss, %s attempts).' % (
+                            QUERY_TIMEOUT_S, QUERY_ATTEMPTS))
+                    else:
+                        raise
         except Exception as e:
             e.exc_info = sys.exc_info()
             result = e
@@ -646,12 +662,12 @@ class AbstractQuery(object):
 class GameSpyQuery(AbstractQuery):
     def raw_query(self):
         return self.server.query(
-            retries=QUERY_ATTEMPTS, timeout=QUERY_TIMEOUT_S)
+            retries=1, timeout=QUERY_TIMEOUT_S)
 
 class StatusQuery(AbstractQuery):
     def raw_query(self):
         return self.server.status(
-            retries=QUERY_ATTEMPTS, timeout=QUERY_TIMEOUT_S)
+            retries=1, timeout=QUERY_TIMEOUT_S)
 
 def fprint(*args, **kwds):
     print(*args, **kwds)
