@@ -6,6 +6,11 @@ import json
 import sys
 import re
 
+try:
+    unicode = unicode
+except NameError:
+    unicode = str
+
 class DecodeError(Exception):
     pass
 
@@ -28,7 +33,7 @@ def decode_string(data):
         return data
 
 def decode_struct(data):
-    if type(data) is str or type(data) is unicode:
+    if type(data) is unicode:
         return data
     elif type(data) is list:
         return ''.join(decode_struct(part) for part in data)

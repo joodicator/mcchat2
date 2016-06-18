@@ -19,6 +19,9 @@ import functools
 import itertools
 import errno
 
+from future.utils import raise_
+from builtins import input
+
 import minecraft.authentication as authentication
 import minecraft.networking.connection as connection
 import minecraft.networking.packets as packets
@@ -43,16 +46,59 @@ AUTH_ATTEMPTS_MAX = 6
 AUTH_RETRY_DELAY_S = 10
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('addr',  metavar='HOST[:PORT]')
-    parser.add_argument('uname', metavar='USERNAME')
-    parser.add_argument('pword', metavar='PASSWORD', nargs='?')
-    parser.add_argument('--offline', dest='offline', action='store_true')
-    parser.add_argument('--standby', dest='standby', action='store_true')
-    parser.add_argument('--protocol', dest='version', metavar='VERSION')
-    parser.add_argument('--plugins', dest='plugins', metavar='NAME', nargs='+')
-    parser.add_argument('--prevent-idle-timeout',
-        dest='prevent_timeout', action='store_true')
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        'addr',  metavar='HOST[:PORT]',
+        help='-- The hostname or IP address of the Minecraft server to which to'
+        'connect, and an optional port number defaulting to %d.' % DEFAULT_PORT)
+    parser.add_argument(
+        'uname', metavar='USERNAME',
+        help='-- If connecting to a server in online mode, the Mojang account name '
+        'to authenticate to - usually an email address; otherwise, the display name '
+        'to use in an offline server.')
+    parser.add_argument(
+        'pword', metavar='PASSWORD', nargs='?',
+        help='-- If connecting to a server in online mode, the password of the Mojang '
+        'account given by USERNAME. If not given on the command line, the user is '
+        'prompted to enter the password on the terminal without echoing.')
+    parser.add_argument(
+        '--help', action='help',
+        help='-- Display information about the command-line arguments of this '
+        'program.')
+    parser.add_argument(
+        '--offline', dest='offline', action='store_true',
+        help='-- Connect to a server in offline mode, i.e. without using Mojang\'s '
+        'authentication server. Standard Mojang servers must be configured with '
+        '"online-mode=false" in the "Server.properties" file.')
+    parser.add_argument(
+        '--standby', dest='standby', action='store_true',
+        help='-- Connect in "standby mode": periodically issue status queries to the '
+        'server to determine the number of users online, connect only when there '
+        'are users online, and disconnect when all other users leave. This can be '
+        'useful to reduce idle resource usage on the server.')
+    parser.add_argument(
+        '--protocol', dest='version', metavar='VERSION',
+        help='-- The protocol version number to use when initially attempting to '
+        'join the server. If this is the incorrect version, the client will attempt '
+        'other version numbers until the correct version is found or all supported '
+        'versions are exhausted. This option defaults to the highest supported '
+        'version, and its effect is only to speed up the negotiation process.')
+    parser.add_argument(
+        '--prevent-idle-timeout', dest='prevent_timeout', action='store_true',
+        help='-- On servers with "player-idle-timeout" set to a nonzero value, '
+        'sends periodic activity to prevent the client from being kicked.')
+    parser.add_argument(
+        '--plugins', dest='plugins', metavar='NAME[,NAME...]',
+        help='-- A comma-separated list of plugin modules to install on the client. '
+        'A plugin is a Python module in the "plugins" directory with a top-level '
+        'function install(conn) which takes a minecraft.networking.Connection '
+        'object which is called by the client each time it connects to the server.')
+    parser.add_argument(
+        '--no-timeout', dest='no_timeout', action='store_true',
+        help=argparse.SUPPRESS)
+    parser.add_argument(
+        '--no-input', dest='no_input', action='store_true',
+        help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     host, port = (
@@ -68,9 +114,10 @@ def main():
         pword = args.pword
 
     plugins = []
-    for plugin in args.plugins or ():
-        file, path, desc = imp.find_module(plugin, ['plugins'])
-        plugins.append(imp.load_module(plugin, file, path, desc))
+    if args.plugins:
+        for plugin in args.plugins.split(','):
+            file, path, desc = imp.find_module(plugin, ['plugins'])
+            plugins.append(imp.load_module(plugin, file, path, desc))
 
     try: version = int(args.version)
     except ValueError: version = args.version
@@ -79,7 +126,8 @@ def main():
     client = Client(
         uname=args.uname, pword=pword, host=host, port=port,
         offline=offline, standby=args.standby, version=version,
-        prevent_timeout=args.prevent_timeout, plugins=plugins)
+        prevent_timeout=args.prevent_timeout, plugins=plugins,
+        no_timeout=args.no_timeout, no_input=args.no_input)
 
     client.start()
     try:
@@ -114,12 +162,14 @@ class PacketHandler(object):
 
 class Client(Thread, PacketHandler):
     def __init__(
-        self, host, port=None, standby=False, plugins=None, *args, **kwds
+        self, host, port=None, standby=False, plugins=None, no_input=False,
+        *args, **kwds
     ):
         super(Client, self).__init__()
         self.daemon = True
         self.name = 'Client'
         self.standby = standby
+        self.no_input = no_input
 
         self.gamespy_query = GameSpyQuery(host=host, port=port)
         if self.standby:
@@ -141,8 +191,11 @@ class Client(Thread, PacketHandler):
     def run(self):
         targets = (
             self.run_player_list,
-            self.run_read_input,
         )
+        if not self.no_input:
+            targets = (
+                self.run_read_input,
+            ) + targets
         if self.standby:
             targets = (
                 self.run_standby,
@@ -169,7 +222,8 @@ class Client(Thread, PacketHandler):
 
     def run_read_input(self):
         while True:
-            text = raw_input().decode('utf8')
+            text = input()
+            if hasattr(text, 'decode'): text = text.decode('utf8')
             match = re.match(r'\?query\s+(\S+)\s*$', text)
             if match:
                 self.serve_query(match.group(1))
@@ -289,7 +343,7 @@ class Client(Thread, PacketHandler):
             new_players = set(
                 json_chat.decode_string(p.display_name)
                 if p.display_name else p.name for p in
-                self.connection.player_list.players_by_uuid.itervalues())
+                self.connection.player_list.players_by_uuid.values())
         with self.rlock:
             if self.players is None:
                 self.list_players(new_players)
@@ -372,8 +426,10 @@ def h_chat_message(self, packet):
                 if player == self.connection.profile_name:
                     omit_message = True
 
-        fprint(json_chat.decode_string(packet.json_data).encode('utf8'),
-            file=sys.stderr if omit_message else sys.stdout)
+        chat_string = json_chat.decode_string(packet.json_data)
+        if type(chat_string) is not str:
+            chat_string = chat_string.encode('utf8')
+        fprint(chat_string, file=sys.stderr if omit_message else sys.stdout)
 
         if new_players is not None:
             self.set_players(new_players)
@@ -386,7 +442,7 @@ def h_player_list_item(self, packet):
 class Connection(PacketHandler):
     def __init__(
         self, uname, pword, host, port=None, offline=False, version=None,
-        prevent_timeout=False, plugins=None
+        prevent_timeout=False, no_timeout=False, plugins=None
     ):
         super(Connection, self).__init__()
         self.uname = uname
@@ -396,6 +452,7 @@ class Connection(PacketHandler):
         self.offline = offline
         self.version = version
         self.prevent_timeout = prevent_timeout
+        self.no_timeout = no_timeout
         self.plugins = plugins
 
         self.rlock = RLock()
@@ -506,7 +563,8 @@ class Connection(PacketHandler):
                         self.disconnect('Timed out (%ss).' % KEEPALIVE_TIMEOUT_S)
                     return
                 self.keep_alive = False
-            conn.networking_thread.join(KEEPALIVE_TIMEOUT_S)
+            conn.networking_thread.join(
+                None if self.no_timeout else KEEPALIVE_TIMEOUT_S)
 
         with self.rlock:
             if conn is self.connection:
@@ -530,7 +588,7 @@ class Connection(PacketHandler):
                 return self._authenticate()
             except YggdrasilError as e:
                 self.auth_token = None
-                if e.message == AUTH_RATE_LIMIT_MESSAGE:
+                if e.args == (AUTH_RATE_LIMIT_MESSAGE,):
                     fprint('Authentication rate-limited; retrying in '
                         '%s seconds (%d/%d).'
                         % (AUTH_RETRY_DELAY_S, i+1, AUTH_ATTEMPTS_MAX),
@@ -605,8 +663,7 @@ class AbstractQuery(object):
             self.start_query_async()
             self.complete_cond.wait()
             if isinstance(self.result, Exception):
-                ty, ex, tb = self.result.exc_info
-                raise ty, ex, tb
+                raise_(*self.result.exc_info)
             else:
                 return self.result
 
