@@ -46,7 +46,7 @@ A machine-usable Minecraft chat console client.
 ## Available Plugins
 
 #### `mapimg`
-When mcchat2 is run with this plugin loaded, e.g. with `--plugins mapimg` in its command-line arguments, then any maps encountered by the client are saved as two image files in `plugins/mcmapimg/maps`:
+When mcchat2 is run with this plugin loaded, e.g. with `--plugins mapimg` in its command-line arguments, then any maps encountered by the client are saved as two image files in `plugins/mapimg/maps`:
 
 1. `map_NUMBER.png` - the main map image without any icons.
 2. `map_NUMBER_icons.png` - an otherwise transparent image containing any map icons.
