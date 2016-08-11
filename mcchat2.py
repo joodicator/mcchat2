@@ -694,8 +694,8 @@ class AbstractQuery(object):
                     if tries < QUERY_ATTEMPTS:
                         fprint('[Query %d/%d] %s' % (
                             tries, QUERY_ATTEMPTS, e), file=sys.stderr)
-                        #if not timed_out:
-                        #    time.sleep(QUERY_RETRY_INTERVAL_S)
+                        if not timed_out:
+                            time.sleep(QUERY_RETRY_INTERVAL_S)
                     elif timed_out:
                         raise Exception('Timed out (%ss, %s attempts).' % (
                             QUERY_TIMEOUT_S, QUERY_ATTEMPTS))
