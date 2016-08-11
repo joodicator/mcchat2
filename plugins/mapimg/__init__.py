@@ -1,1 +1,1 @@
-from mcchat_mapimg import *
+from .mcchat_mapimg import *
