@@ -270,7 +270,7 @@ class Client(Thread, PacketHandler):
                 traceback.print_exc()
                 with self.rlock:
                     fprint('Failed to contact server: %s' % e,
-                        file = sys.stderr if self.reconnecting else sys.stdout)
+                        file = sys.stderr if self.connecting else sys.stdout)
                     self.players = None
                     self.connecting = True
                     self.reconnecting = True
@@ -283,6 +283,8 @@ class Client(Thread, PacketHandler):
                     if self.connecting:
                         fprint('Connected to server in standby mode.',
                             file = sys.stdout if self.reconnecting else sys.stderr)
+                        if self.reconnecting:
+                            self.serve_query('map')
                         self.connecting = False
                         self.reconnecting = False
                 self.set_players(sample_players)
@@ -302,7 +304,7 @@ class Client(Thread, PacketHandler):
                         message = 'Failed to connect to server' if self.connecting \
                              else 'Disconnected from server'
                         fprint('%s: %s' % (message, reason),
-                            file=sys.stderr if self.reconnecting else sys.stdout)
+                            file=sys.stderr if self.connecting else sys.stdout)
                     self.players = None
                     self.connecting = True
                     self.reconnecting = True
@@ -321,7 +323,7 @@ class Client(Thread, PacketHandler):
                 message = 'Failed to connect to server' if self.connecting \
                      else 'Disconnected from server'
                 fprint('%s: %s' % (message, reason),
-                    file=sys.stderr if self.reconnecting else sys.stdout)
+                    file=sys.stderr if self.connecting else sys.stdout)
                 self.reconnecting = True
                 self.connecting = True
             time.sleep(RECONNECT_DELAY_S)
@@ -387,6 +389,8 @@ def h_join_game(self, packet):
     with self.rlock:
         if self.connecting:
             fprint('Connected to server.')
+            if self.reconnecting:
+                self.serve_query('map')
             if self.players is not None:
                 self.list_players(self.players)
         self.connecting = False
@@ -675,7 +679,7 @@ class AbstractQuery(object):
     def start_query_async(self):
         with self.rlock:
             if not self.pending:
-                thread = Thread(target=self.start_query, name='Query')
+                thread = Thread(target=self.start_query, name=type(self).__name__)
                 thread.daemon = True
                 thread.start()
 
@@ -692,8 +696,8 @@ class AbstractQuery(object):
                     timed_out = (isinstance(e, socket.error)
                         and e.errno == errno.ETIMEDOUT)
                     if tries < QUERY_ATTEMPTS:
-                        fprint('[Query %d/%d] %s' % (
-                            tries, QUERY_ATTEMPTS, e), file=sys.stderr)
+                        fprint('[%s %d/%d] %s' % (
+                            type(self).__name__, tries, QUERY_ATTEMPTS, e), file=sys.stderr)
                         if not timed_out:
                             time.sleep(QUERY_RETRY_INTERVAL_S)
                     elif timed_out:
