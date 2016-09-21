@@ -37,9 +37,10 @@ STANDBY_QUERY_INTERVAL_S   = 5
 PREVENT_TIMEOUT_INTERVAL_S = 60
 RECONNECT_DELAY_S          = 5
 
-QUERY_ATTEMPTS         = 10
-QUERY_TIMEOUT_S        = 60
-QUERY_RETRY_INTERVAL_S = 15
+QUERY_ATTEMPTS          = 3
+QUERY_RETRY_INTERVAL_S  = 5
+QUERY_TIMEOUT_S         = 60
+QUERY_TIMEOUT_ATTEMPTS  = 10
 
 AUTH_RATE_LIMIT_MESSAGE = "[403] ForbiddenOperationException: 'Invalid credentials.'"
 AUTH_ATTEMPTS_MAX = 6
@@ -61,6 +62,9 @@ def main():
         help='-- If connecting to a server in online mode, the password of the Mojang '
         'account given by USERNAME. If not given on the command line, the user is '
         'prompted to enter the password on the terminal without echoing.')
+    parser.add_argument(
+        '--password-file', dest='password_file', metavar='FILE',
+        help='-- Read the password for USERNAME from a text file.')
     parser.add_argument(
         '--help', action='help',
         help='-- Display information about the command-line arguments of this '
@@ -105,7 +109,10 @@ def main():
         (args.addr.rsplit(':', 1)[0], int(args.addr.rsplit(':', 1)[1]))
         if ':' in args.addr else (args.addr, None))
     offline = args.offline
-    if args.pword is None and not offline:
+    if args.password_file is not None:
+        with open(args.password_file) as file:
+            pword = file.read().strip()
+    elif args.pword is None and not offline:
         pword = getpass.getpass(
             'Enter password for %s, or leave blank for offline mode: '
             % args.uname) 
@@ -137,9 +144,21 @@ def main():
         client.interrupt()
         client.join(1)
 
-class DisconnectReason(object): pass
-class StandbyDisconnect(DisconnectReason): pass
-class InterruptDisconnect(DisconnectReason): pass
+class DisconnectReason(object):
+    def __init__(self, cause=None):
+        self.cause = cause
+    def __str__(self):
+        if self.cause is None:
+            return super(DisconnectReason, self).__str__()
+        else:
+            return str(self.cause)
+
+class SilentDisconnect(DisconnectReason): pass
+class PermanentDisconnect(DisconnectReason): pass
+
+class UserCollision(PermanentDisconnect): pass
+class StandbyDisconnect(SilentDisconnect): pass
+class InterruptDisconnect(SilentDisconnect, PermanentDisconnect): pass
 
 class PacketHandler(object):
     def install(self, target):
@@ -187,6 +206,7 @@ class Client(Thread, PacketHandler):
         self.reported_left_players = set()
         self.reconnecting = False
         self.connecting = True
+        self.pending_queries = set()
 
     def run(self):
         targets = (
@@ -231,8 +251,13 @@ class Client(Thread, PacketHandler):
                 self.connection.chat(text)
 
     def serve_query(self, query):
+        with self.rlock:
+            if query in self.pending_queries:
+                return
+            self.pending_queries.add(query)
         def h_result(success, result):
             with self.rlock:
+                self.pending_queries.remove(query)
                 fprint('!query %s %s %s' % (
                     'success' if success else 'failure', query, result))
         if query == 'players':
@@ -267,7 +292,8 @@ class Client(Thread, PacketHandler):
             try:
                 result = self.status_query.query()
             except Exception as e:
-                traceback.print_exc()
+                if not isinstance(e, IOError):
+                    traceback.print_exc()
                 with self.rlock:
                     fprint('Failed to contact server: %s' % e,
                         file = sys.stderr if self.connecting else sys.stdout)
@@ -296,18 +322,23 @@ class Client(Thread, PacketHandler):
                 self.connection.disconnect_cond.wait()
                 reason = self.connection.disconnect_reason
 
-            if isinstance(reason, StandbyDisconnect):
-                time.sleep(STANDBY_QUERY_INTERVAL_S)
-            else:
-                with self.rlock:
-                    if not isinstance(reason, InterruptDisconnect):
-                        message = 'Failed to connect to server' if self.connecting \
-                             else 'Disconnected from server'
-                        fprint('%s: %s' % (message, reason),
-                            file=sys.stderr if self.connecting else sys.stdout)
+            with self.rlock:
+                if not isinstance(reason, SilentDisconnect):
+                    message = 'Failed to connect to server' if self.connecting \
+                         else 'Disconnected from server'
+                    fprint('%s: %s' % (message, reason),
+                        file=sys.stderr if self.connecting else sys.stdout)
+                if isinstance(reason, PermanentDisconnect):
+                    self.exit_cond.notify_all()
+                    break
+                elif not isinstance(reason, StandbyDisconnect):
                     self.players = None
                     self.connecting = True
                     self.reconnecting = True
+            
+            if isinstance(reason, StandbyDisconnect):
+                time.sleep(STANDBY_QUERY_INTERVAL_S)
+            else:
                 time.sleep(RECONNECT_DELAY_S)
 
     def run_direct(self):
@@ -317,13 +348,15 @@ class Client(Thread, PacketHandler):
                 self.connection.connect()
                 self.connection.disconnect_cond.wait()
                 reason = self.connection.disconnect_reason
-            if isinstance(reason, InterruptDisconnect):
-                break
             with self.rlock:
-                message = 'Failed to connect to server' if self.connecting \
-                     else 'Disconnected from server'
-                fprint('%s: %s' % (message, reason),
-                    file=sys.stderr if self.connecting else sys.stdout)
+                if not isinstance(reason, SilentDisconnect):
+                    message = 'Failed to connect to server' if self.connecting \
+                         else 'Disconnected from server'
+                    fprint('%s: %s' % (message, reason),
+                        file=sys.stderr if self.connecting else sys.stdout)
+                if isinstance(reason, PermanentDisconnect):
+                    self.exit_cond.notify_all()
+                    break
                 self.reconnecting = True
                 self.connecting = True
             time.sleep(RECONNECT_DELAY_S)
@@ -535,7 +568,8 @@ class Connection(PacketHandler):
         try:
             auth = self.authenticate()
         except Exception as e:
-            traceback.print_exc()
+            if not isinstance(e, IOError):
+                traceback.print_exc()
             return self.disconnect(e)
 
         with self.rlock:
@@ -550,7 +584,8 @@ class Connection(PacketHandler):
         try:
             conn.connect()
         except BaseException as e:
-            traceback.print_exc()
+            if not isinstance(e, IOError):
+                traceback.print_exc()
             return self.disconnect(e)
 
         if self.prevent_timeout:
@@ -573,7 +608,8 @@ class Connection(PacketHandler):
         with self.rlock:
             if conn is self.connection:
                 reason = getattr(conn, 'exception', 'Unknown error.')
-                if isinstance(reason, BaseException):
+                if isinstance(reason, BaseException) \
+                and not isinstance(reason, IOError):
                     traceback.print_exception(*reason.exc_info)
                 self.disconnect(reason)
 
@@ -644,6 +680,8 @@ def h_keep_alive(self, packet):
 @Connection.handle(packets.DisconnectPacket, packets.DisconnectPacketPlayState)
 def h_disconnect(self, packet):
     reason = json_chat.decode_string(packet.json_data)
+    if reason == 'You logged in from another location':
+        reason = UserCollision(reason)
     self.ensure_disconnected(reason)
 
 @Connection.handle(packets.PlayerPositionAndLookPacket)
@@ -695,14 +733,15 @@ class AbstractQuery(object):
                 except Exception as e:
                     timed_out = (isinstance(e, socket.error)
                         and e.errno == errno.ETIMEDOUT)
-                    if tries < QUERY_ATTEMPTS:
+                    if timed_out and tries < QUERY_TIMEOUT_ATTEMPTS \
+                    or not timed_out and tries < QUERY_ATTEMPTS:
                         fprint('[%s %d/%d] %s' % (
                             type(self).__name__, tries, QUERY_ATTEMPTS, e), file=sys.stderr)
                         if not timed_out:
                             time.sleep(QUERY_RETRY_INTERVAL_S)
                     elif timed_out:
                         raise Exception('Timed out (%ss, %s attempts).' % (
-                            QUERY_TIMEOUT_S, QUERY_ATTEMPTS))
+                            QUERY_TIMEOUT_S, tries+1))
                     else:
                         raise
         except Exception as e:
