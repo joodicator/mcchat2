@@ -4,7 +4,7 @@ url = https://github.com/joodicator/mcstatus
 
 [submodule "pyCraft"]
 path = lib/pyCraft
-url = https://github.com/joodicator/pyCraft
+url = https://github.com/ammaraskar/pyCraft
 
 [submodule "mcmapimg"]
 path = plugins/mapimg/mcmapimg
