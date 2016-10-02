@@ -15,7 +15,7 @@ A machine-usable Minecraft chat console client.
 * [mcstatus](//github.com/joodicator/mcstatus) (included as a Git submodule)
   * [dnspython](http://www.dnspython.org)
   * [six](https://pythonhosted.org/six)
-* [pyCraft](//github.com/joodicator/pyCraft) (included as a Git submodule)
+* [pyCraft](//github.com/ammaraskar/pyCraft) (included as a Git submodule)
   * [cryptography](https://cryptography.io)
   * [requests](http://python-requests.org)
 
