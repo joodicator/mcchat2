@@ -727,7 +727,7 @@ class AbstractQuery(object):
         with self.rlock:
             self.pending = True
         try:
-            for tries in itertools.count(1):
+            for tries in itertools.count(QUERY_ATTEMPTS):
                 try:
                     result = self.raw_query()
                     success = True
