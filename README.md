@@ -4,6 +4,8 @@ A machine-usable Minecraft chat console client.
 ## Contents
 1. [Dependencies](#dependencies)
 2. [Installation and Usage](#installation-and-usage)
+3. [Special Input Sequences](#special-input-sequences)
+  1. [`?query`](#query-name)
 4. [Available Plugins](#available-plugins)
   1. [`mapimg`](#mapimg)
 
@@ -42,6 +44,25 @@ A machine-usable Minecraft chat console client.
     ```
     ./mcchat2.py --help
     ```
+
+## Special Input Sequences
+
+While running, each line from mcchat2's standard input is sent to the server (if connected) as one or more chat messages, unless it takes one of the following special forms:
+
+#### `?query NAME`
+
+Ask for the value of the property called `NAME`. The program responds by printing to standard output (possibly after a delay during which other unrelated messages may be printed) either
+  
+  * `!query success NAME VALUE...`  or
+  * `!query failure NAME REASON...`
+
+If the same property is queried more than once, the program *may* respond by issuing only a single reply for several identical queries. The property `NAME` may be any of the following:
+  
+  * `players` - the names of all players on the server, separated by spaces. Only available when connected.
+  * `agent` - the player name that mcchat2 appears as on the server. Only available when connected.
+  * Any key from [the key/value section of Minecraft's query interface](http://wiki.vg/Query#K.2C_V_section). Only available when the server's UDP query interface is enabled.
+
+When starting, and whenever successfully connecting to the server after having previously been disconnected, mcchat2 automatically acts as if `?query map` were issued. Also, when successfully connecting to the server, mcchat2 acts as if `?query agent` were issued. This allows a program listening to mcchat2's standard output to stay up to date with the values of these properties without knowing the internal state of mcchat2.
 
 ## Available Plugins
 
