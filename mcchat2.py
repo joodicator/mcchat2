@@ -548,9 +548,10 @@ class Connection(PacketHandler):
             self.disconnect_cond.notify_all()
 
     def chat(self, text):
-        max_length = packets.ChatPacket.get_max_length(self.connection.context)
         with self.rlock:
             if self.fully_connected:
+                max_length = packets.ChatPacket.get_max_length(
+                    self.connection.context)
                 while len(text) > max_length:
                     self._chat(text[:max_length])
                     text = '...' + text[max_length:]
