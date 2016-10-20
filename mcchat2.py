@@ -3,6 +3,7 @@
 from __future__ import print_function
 
 from threading import Thread, Lock, RLock, Condition
+from functools import *
 import threading
 import sys
 import time
@@ -81,6 +82,11 @@ def main():
         'are users online, and disconnect when all other users leave. This can be '
         'useful to reduce idle resource usage on the server.')
     parser.add_argument(
+        '--quiet-start', dest='quiet_start', action='store_true',
+        help='-- When connecting in standby mode, print the connection message to '
+        'standard error instead of standard output. This can be useful to restart '
+        'the client without generating unnecessary noise.')
+    parser.add_argument(
         '--protocol', dest='version', metavar='VERSION',
         help='-- The protocol version number to use when initially attempting to '
         'join the server. If this is the incorrect version, the client will attempt '
@@ -92,6 +98,10 @@ def main():
         help='-- On servers with "player-idle-timeout" set to a nonzero value, '
         'sends periodic activity to prevent the client from being kicked.')
     parser.add_argument(
+        '--auto-query', dest='auto_query', action='store_true',
+        help='-- Automatically issue "?query map" and "?query agent" at appropriate'
+        ' times. See README.md for a full explanation.')
+    parser.add_argument(
         '--plugins', dest='plugins', metavar='NAME[,NAME...]',
         help='-- A comma-separated list of plugin modules to install on the client. '
         'A plugin is a Python module in the "plugins" directory with a top-level '
@@ -99,10 +109,17 @@ def main():
         'object which is called by the client each time it connects to the server.')
     parser.add_argument(
         '--no-timeout', dest='no_timeout', action='store_true',
-        help=argparse.SUPPRESS)
+        help='-- Disable the default behaviour of disconnecting when no keep-alive '
+        'message has been received from the server for %s seconds. Mainly useful '
+        'for debugging.' % KEEPALIVE_TIMEOUT_S)
     parser.add_argument(
         '--no-input', dest='no_input', action='store_true',
-        help=argparse.SUPPRESS)
+        help='-- Do not read any messages from standard input. Mainly useful for '
+        'debugging.')
+    parser.add_argument(
+        '--show-packets', dest='show_packets', action='store_true',
+        help='-- Print to standard error all sent packets and all received packets '
+        'of known type. Mainly useful for debugging.')
     args = parser.parse_args()
 
     host, port = (
@@ -131,10 +148,20 @@ def main():
     except TypeError: version = args.version
 
     client = Client(
-        uname=args.uname, pword=pword, host=host, port=port,
-        offline=offline, standby=args.standby, version=version,
-        prevent_timeout=args.prevent_timeout, plugins=plugins,
-        no_timeout=args.no_timeout, no_input=args.no_input)
+        uname           = args.uname,
+        pword           = pword,
+        host            = host,
+        port            = port,
+        offline         = offline,
+        standby         = args.standby,
+        quiet_start     = args.quiet_start,
+        version         = version,
+        prevent_timeout = args.prevent_timeout,
+        auto_query      = args.auto_query,
+        plugins         = plugins,
+        no_timeout      = args.no_timeout,
+        no_input        = args.no_input,
+        show_packets    = args.show_packets)
 
     client.start()
     try:
@@ -161,8 +188,13 @@ class StandbyDisconnect(SilentDisconnect): pass
 class InterruptDisconnect(SilentDisconnect, PermanentDisconnect): pass
 
 class PacketHandler(object):
+    def __init__(self):
+        super(PacketHandler, self).__init__()
+        self.inst_packet_handlers = []
+
     def install(self, target):
-        for method, types in self.get_packet_handlers():
+        handlers = self.inst_packet_handlers + self.get_packet_handlers()
+        for method, types in handlers:
             target.register_packet_listener(
                 functools.partial(method, self), *types)
 
@@ -179,15 +211,24 @@ class PacketHandler(object):
             return method
         return d_handle
 
-class Client(Thread, PacketHandler):
+    def inst_handle(self, *types):
+        def d_inst_handle(method):
+            self.inst_packet_handlers.append((method, types))
+            return method
+        return d_inst_handle
+
+class Client(PacketHandler, Thread):
     def __init__(
-        self, host, port=None, standby=False, plugins=None, no_input=False,
+        self, host, port=None, standby=False, plugins=None,
+        auto_query=False, quiet_start=False, no_input=False,
         *args, **kwds
     ):
         super(Client, self).__init__()
         self.daemon = True
         self.name = 'Client'
         self.standby = standby
+        self.auto_query = auto_query
+        self.quiet_start = quiet_start
         self.no_input = no_input
 
         self.gamespy_query = GameSpyQuery(host=host, port=port)
@@ -232,7 +273,8 @@ class Client(Thread, PacketHandler):
                 thread.daemon = True
                 thread.start()
 
-            self.serve_query('map')
+            if self.auto_query:
+                self.serve_query('map')
             self.exit_cond.wait()
 
     def interrupt(self):
@@ -296,7 +338,7 @@ class Client(Thread, PacketHandler):
                     traceback.print_exc()
                 with self.rlock:
                     fprint('Failed to contact server: %s' % e,
-                        file = sys.stderr if self.connecting else sys.stdout)
+                        file = sys.stderr if self.reconnecting else sys.stdout)
                     self.players = None
                     self.connecting = True
                     self.reconnecting = True
@@ -308,8 +350,9 @@ class Client(Thread, PacketHandler):
                 with self.rlock:
                     if self.connecting:
                         fprint('Connected to server in standby mode.',
-                            file = sys.stdout if self.reconnecting else sys.stderr)
-                        if self.reconnecting:
+                            file = sys.stderr if self.quiet_start
+                                   and not self.reconnecting else sys.stdout)
+                        if self.reconnecting and self.auto_query:
                             self.serve_query('map')
                         self.connecting = False
                         self.reconnecting = False
@@ -327,7 +370,7 @@ class Client(Thread, PacketHandler):
                     message = 'Failed to connect to server' if self.connecting \
                          else 'Disconnected from server'
                     fprint('%s: %s' % (message, reason),
-                        file=sys.stderr if self.connecting else sys.stdout)
+                        file=sys.stderr if self.reconnecting else sys.stdout)
                 if isinstance(reason, PermanentDisconnect):
                     self.exit_cond.notify_all()
                     break
@@ -353,7 +396,7 @@ class Client(Thread, PacketHandler):
                     message = 'Failed to connect to server' if self.connecting \
                          else 'Disconnected from server'
                     fprint('%s: %s' % (message, reason),
-                        file=sys.stderr if self.connecting else sys.stdout)
+                        file=sys.stderr if self.reconnecting else sys.stdout)
                 if isinstance(reason, PermanentDisconnect):
                     self.exit_cond.notify_all()
                     break
@@ -422,13 +465,14 @@ def h_join_game(self, packet):
     with self.rlock:
         if self.connecting:
             fprint('Connected to server.')
-            if self.reconnecting:
+            if self.reconnecting and self.auto_query:
                 self.serve_query('map')
             if self.players is not None:
                 self.list_players(self.players)
         self.connecting = False
         self.reconnecting = False
-    self.serve_query('agent')
+    if self.auto_query:
+        self.serve_query('agent')
 
 @Client.handle(packets.ChatMessagePacket)
 def h_chat_message(self, packet):
@@ -479,7 +523,8 @@ def h_player_list_item(self, packet):
 class Connection(PacketHandler):
     def __init__(
         self, uname, pword, host, port=None, offline=False, version=None,
-        prevent_timeout=False, no_timeout=False, plugins=None
+        prevent_timeout=False, no_timeout=False, show_packets=False,
+        plugins=None,
     ):
         super(Connection, self).__init__()
         self.uname = uname
@@ -490,6 +535,7 @@ class Connection(PacketHandler):
         self.version = version
         self.prevent_timeout = prevent_timeout
         self.no_timeout = no_timeout
+        self.show_packets = show_packets
         self.plugins = plugins
 
         self.rlock = RLock()
@@ -503,6 +549,9 @@ class Connection(PacketHandler):
         self.disconnected = True
 
         self.auth_token = None
+
+        if self.show_packets:
+            self.inst_handle(packets.Packet)(self.show_recv_packet)
 
     def ensure_connecting(self):
         with self.rlock:
@@ -580,6 +629,9 @@ class Connection(PacketHandler):
                 self.host, self.port, auth, initial_version=self.version)
             for plugin in (self,) + tuple(self.plugins or ()):
                 plugin.install(conn)
+            if self.show_packets:
+                conn.write_packet = partial(
+                    self.show_send_packet, cont=conn.write_packet)
             self.connection = conn
             self.keep_alive = True
 
@@ -656,6 +708,19 @@ class Connection(PacketHandler):
             elif not self.offline:
                 self.auth_token.refresh()
             return self.auth_token
+
+    @staticmethod
+    def show_recv_packet(self, packet):
+        if type(packet) is not packets.Packet:
+            fprint('> %s' % packet, file=sys.stderr)
+
+    def show_send_packet(self, packet, *args, **kwds):
+        _write = packet.write
+        def write(*args, **kwds):
+            fprint('< %s' % packet, file=sys.stderr)
+            return _write(*args, **kwds)
+        packet.write = write
+        return kwds.pop('cont')(packet, *args, **kwds)
 
 @Connection.handle(packets.LoginSuccessPacket)
 def h_login_success(self, packet):
@@ -777,3 +842,4 @@ def fprint(*args, **kwds):
 
 if __name__ == '__main__':
     main()
+

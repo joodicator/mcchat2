@@ -6,6 +6,7 @@ A machine-usable Minecraft chat console client.
 2. [Installation and Usage](#installation-and-usage)
 3. [Special Input Sequences](#special-input-sequences)
   1. [`?query`](#query-name)
+  2. [`--auto-query`](#auto-query)
 4. [Available Plugins](#available-plugins)
   1. [`mapimg`](#mapimg)
 
@@ -62,7 +63,9 @@ If the same property is queried more than once, the program *may* respond by iss
   * `agent` - the player name that mcchat2 appears as on the server. Only available when connected.
   * Any key from [the key/value section of Minecraft's query interface](http://wiki.vg/Query#K.2C_V_section). Only available when the server's UDP query interface is enabled.
 
-When starting, and whenever successfully connecting to the server after having previously been disconnected, mcchat2 automatically acts as if `?query map` were issued. Also, when successfully connecting to the server, mcchat2 acts as if `?query agent` were issued. This allows a program listening to mcchat2's standard output to stay up to date with the values of these properties without knowing the internal state of mcchat2.
+#### `--auto-query`
+
+If this command-line option is present, then, when starting and whenever successfully connecting to the server after having previously been disconnected, mcchat2 automatically acts as if `?query map` were issued; and, when successfully connecting to the server, mcchat2 acts as if `?query agent` were issued. This allows a program listening to mcchat2's standard output to stay up to date with the values of these properties without knowing the internal state of mcchat2.
 
 ## Available Plugins
 
