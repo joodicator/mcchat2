@@ -171,21 +171,43 @@ def main():
         client.interrupt()
         client.join(1)
 
-class DisconnectReason(object):
+class ExitReason(object):
     def __init__(self, cause=None):
+        super(ExitReason, self).__init__()
         self.cause = cause
     def __str__(self):
         if self.cause is None:
-            return super(DisconnectReason, self).__str__()
+            return super(ExitReason, self).__str__()
         else:
             return str(self.cause)
 
-class SilentDisconnect(DisconnectReason): pass
-class PermanentDisconnect(DisconnectReason): pass
+# A SilentExit does not generate any output.
+class SilentExit(ExitReason):
+    pass
 
-class UserCollision(PermanentDisconnect): pass
-class StandbyDisconnect(SilentDisconnect): pass
-class InterruptDisconnect(SilentDisconnect, PermanentDisconnect): pass
+# A QuietExit generates all output on stderr rather than stdout.
+class QuietExit(ExitReason):
+    pass
+
+# A PermanentExit causes the client program to terminate.
+class PermanentExit(ExitReason):
+    pass
+
+class StandbyExit(SilentExit):
+    pass
+
+class UserCollision(PermanentExit):
+    def __init__(self, cause=None):
+        super(UserCollision, self).__init__(
+            cause or 'User collision.')
+
+class ManualExit(PermanentExit):
+    def __init__(self, cause=None):
+        super(ManualExit, self).__init__(
+            cause or 'Manually closed.')
+
+class QuietManualExit(QuietExit, ManualExit):
+    pass
 
 class PacketHandler(object):
     def __init__(self):
@@ -278,19 +300,36 @@ class Client(PacketHandler, Thread):
             self.exit_cond.wait()
 
     def interrupt(self):
-        with self.rlock:
-            self.connection.ensure_disconnected(InterruptDisconnect())
-            self.exit_cond.notify_all()
+        self.exit(ManualExit())
 
     def run_read_input(self):
         while True:
             text = input()
             if hasattr(text, 'decode'): text = text.decode('utf8')
+
             match = re.match(r'\?query\s+(\S+)\s*$', text)
             if match:
                 self.serve_query(match.group(1))
-            else:
-                self.connection.chat(text)
+                continue
+
+            match = re.match(r'\?exit(?P<quiet>\s+--quiet)?(?P<msg>\s+.*)?', text)
+            if match:
+                self.exit(
+                    (QuietManualExit if match.group('quiet') else ManualExit)(
+                        (match.group('msg') or '').strip()))
+                continue
+
+            self.connection.chat(text)
+
+    def exit(self, reason):
+        was_connected = self.connection.ensure_disconnected(reason)
+        if not isinstance(reason, PermanentExit): return
+        with self.rlock:
+            if not (was_connected or isinstance(reason, SilentExit)):
+                fprint('Disconnected: %s' % reason,
+                    file = sys.stderr if isinstance(reason, QuietExit)
+                      else sys.stdout)
+            self.exit_cond.notify_all()
 
     def serve_query(self, query):
         with self.rlock:
@@ -366,20 +405,20 @@ class Client(PacketHandler, Thread):
                 reason = self.connection.disconnect_reason
 
             with self.rlock:
-                if not isinstance(reason, SilentDisconnect):
+                if not isinstance(reason, SilentExit):
                     message = 'Failed to connect to server' if self.connecting \
                          else 'Disconnected from server'
                     fprint('%s: %s' % (message, reason),
                         file=sys.stderr if self.reconnecting else sys.stdout)
-                if isinstance(reason, PermanentDisconnect):
+                if isinstance(reason, PermanentExit):
                     self.exit_cond.notify_all()
                     break
-                elif not isinstance(reason, StandbyDisconnect):
+                elif not isinstance(reason, StandbyExit):
                     self.players = None
                     self.connecting = True
                     self.reconnecting = True
             
-            if isinstance(reason, StandbyDisconnect):
+            if isinstance(reason, StandbyExit):
                 time.sleep(STANDBY_QUERY_INTERVAL_S)
             else:
                 time.sleep(RECONNECT_DELAY_S)
@@ -392,12 +431,12 @@ class Client(PacketHandler, Thread):
                 self.connection.disconnect_cond.wait()
                 reason = self.connection.disconnect_reason
             with self.rlock:
-                if not isinstance(reason, SilentDisconnect):
+                if not isinstance(reason, SilentExit):
                     message = 'Failed to connect to server' if self.connecting \
                          else 'Disconnected from server'
                     fprint('%s: %s' % (message, reason),
                         file=sys.stderr if self.reconnecting else sys.stdout)
-                if isinstance(reason, PermanentDisconnect):
+                if isinstance(reason, PermanentExit):
                     self.exit_cond.notify_all()
                     break
                 self.reconnecting = True
@@ -451,7 +490,7 @@ class Client(PacketHandler, Thread):
                     self.reported_joined_players.discard(removed_player)
 
             if self.standby and not (new_players - {profile_name}):
-                self.connection.ensure_disconnected(StandbyDisconnect())
+                self.connection.ensure_disconnected(StandbyExit())
 
             self.players = new_players
 
@@ -557,11 +596,15 @@ class Connection(PacketHandler):
         with self.rlock:
             if self.disconnected:
                 self.connect()
+                return True
+        return False
 
     def ensure_disconnected(self, reason=None):
         with self.rlock:
             if not self.disconnected:
                 self.disconnect(reason)
+                return True
+        return False
 
     def connect(self):
         with self.rlock:
