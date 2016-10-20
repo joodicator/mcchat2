@@ -6,7 +6,8 @@ A machine-usable Minecraft chat console client.
 2. [Installation and Usage](#installation-and-usage)
 3. [Special Input Sequences](#special-input-sequences)
   1. [`?query`](#query-name)
-  2. [`--auto-query`](#--auto-query)
+  2. [`?exit`](#exit)
+  3. [`--auto-query`](#--auto-query)
 4. [Available Plugins](#available-plugins)
   1. [`mapimg`](#mapimg)
 
@@ -62,6 +63,10 @@ If the same property is queried more than once, the program *may* respond by iss
   * `players` - the names of all players on the server, separated by spaces. Only available when connected.
   * `agent` - the player name that mcchat2 appears as on the server. Only available when connected.
   * Any key from [the key/value section of Minecraft's query interface](http://wiki.vg/Query#K.2C_V_section). Only available when the server's UDP query interface is enabled.
+
+#### `?exit [--quiet] [REASON...]`
+
+Cause the program to disconnect from the server if connected, and then terminate, printing the given exit reason to standard error if currently disconnected from the server in standby mode and the `--quiet` flag is included, or otherwise to standard output. If `REASON` is not given, it defaults to `Manually closed.` The `--quiet` flag is useful in combination with the `--quiet-start` command-line flag of mcchat2 to restart the client when it is in standby mode, without causing unnecessary noise.
 
 #### `--auto-query`
 
