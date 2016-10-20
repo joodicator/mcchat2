@@ -203,12 +203,12 @@ class StandbyExit(SilentExit):
 class UserCollision(PermanentExit):
     def __init__(self, cause=None, *args, **kwds):
         super(UserCollision, self).__init__(
-            cause or 'User collision.', *args, **kwds)
+            cause or 'user collision.', *args, **kwds)
 
 class ManualExit(PermanentExit):
     def __init__(self, cause=None, *args, **kwds):
         super(ManualExit, self).__init__(
-            cause or 'Manually closed.', *args, **kwds)
+            cause or 'manually closed.', *args, **kwds)
 
 class QuietManualExit(QuietExit, ManualExit):
     pass
