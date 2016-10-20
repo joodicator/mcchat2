@@ -6,7 +6,7 @@ A machine-usable Minecraft chat console client.
 2. [Installation and Usage](#installation-and-usage)
 3. [Special Input Sequences](#special-input-sequences)
   1. [`?query`](#query-name)
-  2. [`--auto-query`](#auto-query)
+  2. [`--auto-query`](#--auto-query)
 4. [Available Plugins](#available-plugins)
   1. [`mapimg`](#mapimg)
 
