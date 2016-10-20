@@ -6,7 +6,7 @@ A machine-usable Minecraft chat console client.
 2. [Installation and Usage](#installation-and-usage)
 3. [Special Input Sequences](#special-input-sequences)
   1. [`?query`](#query-name)
-  2. [`?exit`](#exit---quiet-reason)
+  2. [`?exit`](#exit---quiet---coden-reason)
   3. [`--auto-query`](#--auto-query)
 4. [Available Plugins](#available-plugins)
   1. [`mapimg`](#mapimg)
@@ -66,7 +66,7 @@ If the same property is queried more than once, the program *may* respond by iss
 
 #### `?exit [--quiet] [--code=N] [REASON...]`
 
-Cause the program to exit, disconnecting first from the server if necessary. If a `REASON` is given, this printed to standard output or standard error, otherwise it defaults to `Manually closed.`
+Cause the program to exit, disconnecting first from the server if necessary. If a `REASON` is given, this printed to standard output or standard error; otherwise, it defaults to `Manually closed.`
 
 If the `--quiet` flag is present and the program is currently disconnected from the server in standby mode, the exit reason is printed to standard error rather than standard output. This can be useful in combination with the `--quiet-start` command-line flag of mcchat2 to restart the client without causing unnecessary noise.
 
