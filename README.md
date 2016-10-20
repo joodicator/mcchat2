@@ -64,9 +64,13 @@ If the same property is queried more than once, the program *may* respond by iss
   * `agent` - the player name that mcchat2 appears as on the server. Only available when connected.
   * Any key from [the key/value section of Minecraft's query interface](http://wiki.vg/Query#K.2C_V_section). Only available when the server's UDP query interface is enabled.
 
-#### `?exit [--quiet] [REASON...]`
+#### `?exit [--quiet] [--code=N] [REASON...]`
 
-Cause the program to disconnect from the server if connected, and then terminate, printing the given exit reason to standard error if currently disconnected from the server in standby mode and the `--quiet` flag is included, or otherwise to standard output. If `REASON` is not given, it defaults to `Manually closed.` The `--quiet` flag is useful in combination with the `--quiet-start` command-line flag of mcchat2 to restart the client when it is in standby mode, without causing unnecessary noise.
+Cause the program to exit, disconnecting first from the server if necessary. If a `REASON` is given, this printed to standard output or standard error, otherwise it defaults to `Manually closed.`
+
+If the `--quiet` flag is present and the program is currently disconnected from the server in standby mode, the exit reason is printed to standard error rather than standard output. This can be useful in combination with the `--quiet-start` command-line flag of mcchat2 to restart the client without causing unnecessary noise.
+
+If `--code=N` is given, then `N` is used as the exit status code of the program; otherwise, it defaults to 0.
 
 #### `--auto-query`
 

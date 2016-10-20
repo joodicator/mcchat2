@@ -171,10 +171,14 @@ def main():
         client.interrupt()
         client.join(1)
 
+    if isinstance(client.exit_reason, ExitReason):
+        sys.exit(client.exit_reason.exit_code)
+
 class ExitReason(object):
-    def __init__(self, cause=None):
+    def __init__(self, cause=None, code=None):
         super(ExitReason, self).__init__()
         self.cause = cause
+        self.exit_code = code
     def __str__(self):
         if self.cause is None:
             return super(ExitReason, self).__str__()
@@ -197,14 +201,14 @@ class StandbyExit(SilentExit):
     pass
 
 class UserCollision(PermanentExit):
-    def __init__(self, cause=None):
+    def __init__(self, cause=None, *args, **kwds):
         super(UserCollision, self).__init__(
-            cause or 'User collision.')
+            cause or 'User collision.', *args, **kwds)
 
 class ManualExit(PermanentExit):
-    def __init__(self, cause=None):
+    def __init__(self, cause=None, *args, **kwds):
         super(ManualExit, self).__init__(
-            cause or 'Manually closed.')
+            cause or 'Manually closed.', *args, **kwds)
 
 class QuietManualExit(QuietExit, ManualExit):
     pass
@@ -263,6 +267,7 @@ class Client(PacketHandler, Thread):
 
         self.rlock = RLock()
         self.exit_cond = Condition(self.rlock)
+        self.exit_reason = None
         self.player_list_cond = Condition(self.rlock)
         self.players = None
         self.reported_joined_players = set()
@@ -312,11 +317,23 @@ class Client(PacketHandler, Thread):
                 self.serve_query(match.group(1))
                 continue
 
-            match = re.match(r'\?exit(?P<quiet>\s+--quiet)?(?P<msg>\s+.*)?', text)
+            match = re.match(r'\?exit\s*(.*)', text)
             if match:
+                msg, quiet, code = match.group(1), False, 0
+                while msg.startswith('--'):
+                    match = re.match(r'--(?P<key>[^\s=]*)(=(?P<val>\S+))?\s*(?P<rem>.*)', msg)
+                    if match.group('key') == 'quiet' and match.group('val') is None:
+                        quiet = True
+                    elif match.group('key') == 'code' and match.group('val') is not None \
+                    and re.match(r'\d+$', match.group('val')):
+                        code = int(match.group('val'))
+                    else:
+                        fprint('Error: invalid argument: "%s".' % match.group(),
+                            file=sys.stderr)
+                        continue
+                    msg = match.group('rem')
                 self.exit(
-                    (QuietManualExit if match.group('quiet') else ManualExit)(
-                        (match.group('msg') or '').strip()))
+                    (QuietManualExit if quiet else ManualExit)(msg.strip(), code=code))
                 continue
 
             self.connection.chat(text)
@@ -329,6 +346,7 @@ class Client(PacketHandler, Thread):
                 fprint('Disconnected: %s' % reason,
                     file = sys.stderr if isinstance(reason, QuietExit)
                       else sys.stdout)
+            self.exit_reason = reason
             self.exit_cond.notify_all()
 
     def serve_query(self, query):
@@ -411,6 +429,7 @@ class Client(PacketHandler, Thread):
                     fprint('%s: %s' % (message, reason),
                         file=sys.stderr if self.reconnecting else sys.stdout)
                 if isinstance(reason, PermanentExit):
+                    self.exit_reason = reason
                     self.exit_cond.notify_all()
                     break
                 elif not isinstance(reason, StandbyExit):
@@ -437,6 +456,7 @@ class Client(PacketHandler, Thread):
                     fprint('%s: %s' % (message, reason),
                         file=sys.stderr if self.reconnecting else sys.stdout)
                 if isinstance(reason, PermanentExit):
+                    self.exit_reason = reason
                     self.exit_cond.notify_all()
                     break
                 self.reconnecting = True
