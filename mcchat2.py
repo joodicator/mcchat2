@@ -560,7 +560,7 @@ def h_chat_message(self, packet):
             player = None
             new_players = None
 
-        if data.get('translate').startswith('chat.type.'):
+        if 'translate' in data and data['translate'].startswith('chat.type.'):
             with self.connection.rlock:
                 player = json_chat.decode_struct(using[0])
                 if player == self.connection.profile_name:
@@ -643,13 +643,7 @@ class Connection(PacketHandler):
 
             if self.connection is not None:
                 self.connection.packet_listeners[:] = []
-                sock = self.connection.socket
-                if hasattr(sock, 'actual_socket'):
-                    sock = sock.actual_socket
-                try: sock.shutdown(socket.SHUT_RDWR)
-                except IOError: pass
-                try: sock.close()
-                except IOError: pass
+                self.connection.disconnect()
                 self.connection = None
 
             self.player_list = None
@@ -687,9 +681,23 @@ class Connection(PacketHandler):
             return self.disconnect(e)
 
         with self.rlock:
-            self.profile_name = auth.profile.name
+            if auth is None:
+                kwds = {'username': self.uname}
+                self.profile_name = self.uname
+            else:
+                kwds = {'auth_token': auth}
+                self.profile_name = auth.profile.name
+
+            def conn_exception(exc, exc_info):
+                with self.rlock:
+                    if conn is self.connection:
+                        if not isinstance(exc, IOError):
+                            traceback.print_exception(*exc_info)
+                        self.disconnect(exc)
+        
             conn = connection.Connection(
-                self.host, self.port, auth, initial_version=self.version)
+                self.host, self.port, initial_version=self.version,
+                handle_exception=conn_exception, **kwds)
             for plugin in (self,) + tuple(self.plugins or ()):
                 plugin.install(conn)
             if self.show_packets:
@@ -712,24 +720,15 @@ class Connection(PacketHandler):
             thread.daemon = True
             thread.start()
 
-        while conn.networking_thread.is_alive():
+        if self.no_timeout: return
+        while conn is self.connection:
             with self.rlock:
                 if not self.keep_alive:
-                    if conn is self.connection:
-                        self.disconnect('Timed out (%ss).' % KEEPALIVE_TIMEOUT_S)
+                    self.disconnect('Timed out (%ss).' % KEEPALIVE_TIMEOUT_S)
                     return
                 self.keep_alive = False
-            conn.networking_thread.join(
-                None if self.no_timeout else KEEPALIVE_TIMEOUT_S)
-
-        with self.rlock:
-            if conn is self.connection:
-                reason = getattr(conn, 'exception', 'Unknown error.')
-                if isinstance(reason, BaseException) \
-                and not isinstance(reason, IOError):
-                    traceback.print_exception(*reason.exc_info)
-                self.disconnect(reason)
-
+                self.disconnect_cond.wait(KEEPALIVE_TIMEOUT_S)
+   
     def run_prevent_timeout(self):
         with self.rlock:
             while True:
@@ -759,16 +758,12 @@ class Connection(PacketHandler):
 
     def _authenticate(self):
         with self.rlock:
-            if self.auth_token is None and self.offline:
-                self.auth_token = authentication.AuthenticationToken(
-                    '-', '-', '-')
-                self.auth_token.profile.id_ = '-'
-                self.auth_token.profile.name = self.uname
-                self.auth_token.join = lambda *a, **k: None
+            if self.offline:
+                self.auth_token = None
             elif self.auth_token is None:
                 self.auth_token = authentication.AuthenticationToken()
                 self.auth_token.authenticate(self.uname, self.pword)
-            elif not self.offline:
+            else:
                 self.auth_token.refresh()
             return self.auth_token
 
