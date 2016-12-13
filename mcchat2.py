@@ -47,6 +47,8 @@ AUTH_RATE_LIMIT_MESSAGE = "[403] ForbiddenOperationException: 'Invalid credentia
 AUTH_ATTEMPTS_MAX = 6
 AUTH_RETRY_DELAY_S = 10
 
+NO_TRACE_ERRORS = socket.timeout,
+
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
@@ -391,12 +393,12 @@ class Client(PacketHandler, Thread):
             try:
                 result = self.status_query.query()
             except Exception as e:
-                if not isinstance(e, IOError):
+                if not isinstance(e, NO_TRACE_ERRORS):
                     traceback.print_exc()
                 with self.rlock:
                     fprint('Failed to contact server: %s' % e,
                         file = sys.stderr if self.reconnecting else sys.stdout)
-                    self.players = None
+                    self.set_players(None)
                     self.connecting = True
                     self.reconnecting = True
                     time.sleep(RECONNECT_DELAY_S)
@@ -427,13 +429,14 @@ class Client(PacketHandler, Thread):
                     message = 'Failed to connect to server' if self.connecting \
                          else 'Disconnected from server'
                     fprint('%s: %s' % (message, reason),
-                        file=sys.stderr if self.reconnecting else sys.stdout)
+                        file=sys.stderr if self.reconnecting or
+                        self.connecting and self.silent_start else sys.stdout)
                 if isinstance(reason, PermanentExit):
                     self.exit_reason = reason
                     self.exit_cond.notify_all()
                     break
                 elif not isinstance(reason, StandbyExit):
-                    self.players = None
+                    self.set_players(None)
                     self.connecting = True
                     self.reconnecting = True
             
@@ -454,7 +457,8 @@ class Client(PacketHandler, Thread):
                     message = 'Failed to connect to server' if self.connecting \
                          else 'Disconnected from server'
                     fprint('%s: %s' % (message, reason),
-                        file=sys.stderr if self.reconnecting else sys.stdout)
+                        file=sys.stderr if self.reconnecting or self.connecting
+                        and self.silent_start else sys.stdout)
                 if isinstance(reason, PermanentExit):
                     self.exit_reason = reason
                     self.exit_cond.notify_all()
@@ -488,11 +492,19 @@ class Client(PacketHandler, Thread):
 
     def set_players(self, new_players):
         with self.rlock:
+            old_players = self.players
+            self.players = new_players
+
+            if new_players is None:
+                self.reported_joined_players.clear()
+                self.reported_left_players.clear()
+                return            
+
             with self.connection.rlock:
                 profile_name = self.connection.profile_name
 
-            if self.players is not None:
-                for added_player in new_players - self.players:
+            if old_players is not None:
+                for added_player in new_players - old_players:
                     if (added_player not in self.reported_joined_players
                     and added_player != profile_name):
                         fprint(json_chat.decode_struct({
@@ -500,7 +512,7 @@ class Client(PacketHandler, Thread):
                             'using': [added_player]}))
                     self.reported_joined_players.add(added_player)
                     self.reported_left_players.discard(added_player)
-                for removed_player in self.players - new_players:
+                for removed_player in old_players - new_players:
                     if (removed_player not in self.reported_left_players
                     and removed_player != profile_name):
                         fprint(json_chat.decode_struct({
@@ -511,8 +523,6 @@ class Client(PacketHandler, Thread):
 
             if self.standby and not (new_players - {profile_name}):
                 self.connection.ensure_disconnected(StandbyExit())
-
-            self.players = new_players
 
     def list_players(self, players):
         players_str = ', '.join(sorted(players)) if players else '(none)'
@@ -676,7 +686,7 @@ class Connection(PacketHandler):
         try:
             auth = self.authenticate()
         except Exception as e:
-            if not isinstance(e, IOError):
+            if not isinstance(e, NO_TRACE_ERRORS):
                 traceback.print_exc()
             return self.disconnect(e)
 
@@ -691,7 +701,7 @@ class Connection(PacketHandler):
             def conn_exception(exc, exc_info):
                 with self.rlock:
                     if conn is self.connection:
-                        if not isinstance(exc, IOError):
+                        if not isinstance(exc, NO_TRACE_ERRORS):
                             traceback.print_exception(*exc_info)
                         self.disconnect(exc)
         
@@ -709,7 +719,7 @@ class Connection(PacketHandler):
         try:
             conn.connect()
         except BaseException as e:
-            if not isinstance(e, IOError):
+            if not isinstance(e, NO_TRACE_ERRORS):
                 traceback.print_exc()
             return self.disconnect(e)
 
