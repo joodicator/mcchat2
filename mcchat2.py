@@ -430,7 +430,7 @@ class Client(PacketHandler, Thread):
                          else 'Disconnected from server'
                     fprint('%s: %s' % (message, reason),
                         file=sys.stderr if self.reconnecting or
-                        self.connecting and self.silent_start else sys.stdout)
+                        self.connecting and self.quiet_start else sys.stdout)
                 if isinstance(reason, PermanentExit):
                     self.exit_reason = reason
                     self.exit_cond.notify_all()
@@ -458,7 +458,7 @@ class Client(PacketHandler, Thread):
                          else 'Disconnected from server'
                     fprint('%s: %s' % (message, reason),
                         file=sys.stderr if self.reconnecting or self.connecting
-                        and self.silent_start else sys.stdout)
+                        and self.quiet_start else sys.stdout)
                 if isinstance(reason, PermanentExit):
                     self.exit_reason = reason
                     self.exit_cond.notify_all()
