@@ -19,6 +19,7 @@ import traceback
 import functools
 import itertools
 import errno
+import stat
 
 from future.utils import raise_
 from builtins import input
@@ -33,6 +34,10 @@ import json_chat
 
 DEFAULT_PORT = 25565
 
+AUTH_TOKENS_FILE      = '.mcchat-auth-tokens'
+AUTH_TOKENS_MODE      = stat.S_IRUSR | stat.S_IWUSR
+AUTH_TOKENS_MODE_WARN = stat.S_IRWXG | stat.S_IRWXO
+
 KEEPALIVE_TIMEOUT_S        = 30
 STANDBY_QUERY_INTERVAL_S   = 5
 PREVENT_TIMEOUT_INTERVAL_S = 60
@@ -42,10 +47,6 @@ QUERY_ATTEMPTS          = 3
 QUERY_RETRY_INTERVAL_S  = 5
 QUERY_TIMEOUT_S         = 60
 QUERY_TIMEOUT_ATTEMPTS  = 10
-
-AUTH_RATE_LIMIT_MESSAGE = "[403] ForbiddenOperationException: 'Invalid credentials.'"
-AUTH_ATTEMPTS_MAX = 6
-AUTH_RETRY_DELAY_S = 10
 
 NO_TRACE_ERRORS = socket.timeout,
 
@@ -749,33 +750,46 @@ class Connection(PacketHandler):
                 self.connection.write_packet(packet)
 
     def authenticate(self):
-        for i in range(AUTH_ATTEMPTS_MAX):
-            try:
-                return self._authenticate()
-            except YggdrasilError as e:
-                self.auth_token = None
-                if e.args == (AUTH_RATE_LIMIT_MESSAGE,):
-                    fprint('Authentication rate-limited; retrying in '
-                        '%s seconds (%d/%d).'
-                        % (AUTH_RETRY_DELAY_S, i+1, AUTH_ATTEMPTS_MAX),
-                        file=sys.stderr)
-                    time.sleep(AUTH_RETRY_DELAY_S)
-                else:
-                    raise
-        raise Exception(
-            'Authentication abandoned after being rate-limited %d times.'
-                % AUTH_ATTEMPTS_MAX)
-
-    def _authenticate(self):
         with self.rlock:
             if self.offline:
                 self.auth_token = None
-            elif self.auth_token is None:
-                self.auth_token = authentication.AuthenticationToken()
-                self.auth_token.authenticate(self.uname, self.pword)
-            else:
-                self.auth_token.refresh()
+                return None
+            tokens = load_auth_tokens()
+            if self.auth_token is None:
+                token = tokens.get(self.uname.lower())
+                if token is not None:
+                    self.auth_token = authentication.AuthenticationToken(
+                        username=self.uname,
+                        access_token=token['accessToken'],
+                        client_token=token['clientToken'])
+            if self.auth_token is not None:
+                try:
+                    self.auth_token.refresh()
+                except YggdrasilError:
+                    self.auth_token = None
+            if self.auth_token is None:
+                try:
+                    self.auth_token = authentication.AuthenticationToken()
+                    self.auth_token.authenticate(self.uname, self.pword)
+                except YggdrasilError:
+                    self.auth_token = None
+                    self._authenticate_save(tokens=tokens)
+                    raise
+            self._authenticate_save(tokens=tokens)
             return self.auth_token
+
+    def _authenticate_save(self, tokens=None):
+        luname = self.uname.lower()
+        if tokens is None:
+            tokens = load_auth_tokens()
+        if self.auth_token is not None:
+            tokens[luname] = {
+                'accessToken': self.auth_token.access_token,
+                'clientToken': self.auth_token.client_token}
+        elif luname in tokens:
+            del tokens[luname]
+        if tokens.get(luname) != self.auth_token:
+            save_auth_tokens(tokens)
 
     @staticmethod
     def show_recv_packet(self, packet):
@@ -908,6 +922,28 @@ def fprint(*args, **kwds):
     print(*args, **kwds)
     kwds.get('file', sys.stdout).flush()
 
+def load_auth_tokens(file_path=AUTH_TOKENS_FILE):
+    if os.path.exists(file_path):
+        with open(file_path) as file:
+            if os.name == 'posix':
+                fstat = os.fstat(file.fileno())
+                if fstat.st_mode & AUTH_TOKENS_MODE_WARN:
+                    fprint('Warning: %s is not protected from access by other'
+                           ' users (access mode %03o; should be %03o).'
+                           % (AUTH_TOKENS_FILE, fstat.st_mode, AUTH_TOKENS_MODE),
+                           file=sys.stderr)
+            try:
+                return json.load(file)
+            except ValueError:
+                pass
+    return {}
+
+def save_auth_tokens(auth_tokens, file_path=AUTH_TOKENS_FILE):
+    exists = os.path.exists(file_path)
+    with open(file_path, 'w') as file:
+        json.dump(auth_tokens, file, indent=4)
+        if not exists and os.name == 'posix':
+            os.fchmod(file.fileno(), AUTH_TOKENS_MODE)
+
 if __name__ == '__main__':
     main()
-
