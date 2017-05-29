@@ -91,11 +91,9 @@ def main():
         'the client without generating unnecessary noise.')
     parser.add_argument(
         '--protocol', dest='version', metavar='VERSION',
-        help='-- The protocol version number to use when initially attempting to '
-        'join the server. If this is the incorrect version, the client will attempt '
-        'other version numbers until the correct version is found or all supported '
-        'versions are exhausted. This option defaults to the highest supported '
-        'version, and its effect is only to speed up the negotiation process.')
+        help='-- The version name (such as 1.12, 1.12-pre6, or 17w18b) or protocol '
+        'number (such as 333) of the Minecraft version to use when connecting to the '
+        'server. If unspecified, the server\'s highest supported version is used.')
     parser.add_argument(
         '--prevent-idle-timeout', dest='prevent_timeout', action='store_true',
         help='-- On servers with "player-idle-timeout" set to a nonzero value, '
@@ -705,9 +703,10 @@ class Connection(PacketHandler):
                         if not isinstance(exc, NO_TRACE_ERRORS):
                             traceback.print_exception(*exc_info)
                         self.disconnect(exc)
-        
+
+            allowed_versions = None if self.version is None else {self.version}
             conn = connection.Connection(
-                self.host, self.port, initial_version=self.version,
+                self.host, self.port, allowed_versions=allowed_versions,
                 handle_exception=conn_exception, **kwds)
             for plugin in (self,) + tuple(self.plugins or ()):
                 plugin.install(conn)
