@@ -318,9 +318,9 @@ class Client(PacketHandler, Thread):
                 self.serve_query(match.group(1))
                 continue
 
-            match = re.match(r'\?exit\s*(.*)', text)
+            match = re.match(r'\?exit(\s+(?P<msg>.*))?', text)
             if match:
-                msg, quiet, code = match.group(1), False, 0
+                msg, quiet, code = match.group('msg') or '', False, 0
                 while msg.startswith('--'):
                     match = re.match(r'--(?P<key>[^\s=]*)(=(?P<val>\S+))?\s*(?P<rem>.*)', msg)
                     if match.group('key') == 'quiet' and match.group('val') is None:
@@ -335,6 +335,15 @@ class Client(PacketHandler, Thread):
                     msg = match.group('rem')
                 self.exit(
                     (QuietManualExit if quiet else ManualExit)(msg.strip(), code=code))
+                continue
+
+            match = re.match(r'\?eval\s+(?P<expr>.*)', text)
+            if match:
+                try:
+                    result = eval(match.group('expr'))
+                    fprint(repr(result), file=sys.stderr)
+                except:
+                    traceback.print_exc()
                 continue
 
             self.connection.chat(text)
