@@ -858,9 +858,8 @@ class AbstractQuery(object):
         self.waiting = []
 
     def query(self):
+        self.start_query()
         with self.rlock:
-            self.start_query_async()
-            self.complete_cond.wait()
             if isinstance(self.result, Exception):
                 raise_(*self.result.exc_info)
             else:
