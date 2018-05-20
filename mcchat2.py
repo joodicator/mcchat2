@@ -54,8 +54,9 @@ def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         'addr',  metavar='HOST[:PORT]',
-        help='-- The hostname or IP address of the Minecraft server to which to'
-        'connect, and an optional port number defaulting to %d.' % DEFAULT_PORT)
+        help='-- The hostname or IP address of the Minecraft server to which '
+        'to connect, and an optional port number defaulting to %d. If HOST is '
+        'an IPv6 address, it must be enclosed in square brackets.' % DEFAULT_PORT)
     parser.add_argument(
         'uname', metavar='USERNAME',
         help='-- If connecting to a server in online mode, the Mojang account name '
@@ -123,9 +124,13 @@ def main():
         'of known type. Mainly useful for debugging.')
     args = parser.parse_args()
 
-    host, port = (
-        (args.addr.rsplit(':', 1)[0], int(args.addr.rsplit(':', 1)[1]))
-        if ':' in args.addr else (args.addr, None))
+    match = re.match(r'((?P<host>[^\[\]:]+)|\[(?P<addr>[^\[\]]+)\])'
+                     r'(:(?P<port>\d+))?$', args.addr)
+    if match is None:
+        raise ValueError('Invalid server address: %r.' % options.server)
+    host = match.group('host') or match.group('addr')
+    port = int(match.group('port')) if match.group('port') else None
+
     offline = args.offline
     if args.password_file is not None:
         with open(args.password_file) as file:
