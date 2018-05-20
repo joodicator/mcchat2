@@ -26,7 +26,7 @@ A machine-usable Minecraft chat console client.
 ### Optional
 * [mcmapimg](//github.com/joodicator/mcmapimg) (for the `mapimg` plugin; included as a Git submodule)
   * [PIL](http://www.pythonware.com/products/pil)
-  * [PyNBT](https://github.com/TkTech/PyNBT) (included as a Git submodule)
+  * [PyNBT](https://github.com/TkTech/PyNBT)
 * [Git](http://git-scm.com) (to install from GitHub)
 
 ## Installation and Usage
