@@ -15,11 +15,14 @@ class DecodeError(Exception):
     pass
 
 def load_language(file):
-    language = dict()
-    for line in file:
-        try: name, value = line.split('=', 1)
-        except ValueError: continue
-        language[name] = value.strip()
+    try:
+        return json.load(file)
+    except ValueError:
+        language = dict()
+        for line in file:
+            try: name, value = line.split('=', 1)
+            except ValueError: continue
+            language[name] = value.strip()
     return language
 
 with open(os.path.join(os.path.dirname(__file__), './en_US.lang')) as file:
