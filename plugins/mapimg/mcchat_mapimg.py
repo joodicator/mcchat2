@@ -21,10 +21,11 @@ def h_map(packet):
     if packet.pixels is not None:
         file_path = os.path.join(
             os.path.dirname(__file__), 'maps', 'map_%d.png' % map.id)
+        print('mapimg: updating %s...' % file_path, end='', file=sys.stderr)
         with open(file_path, 'wb') as file:
             mcmapimg.map_data_to_img(map.pixels, file,
                 width=map.width, height=map.height, warn=True)
-        print('mapimg: updated %s.' % file_path, file=sys.stderr)
+        print(' done.', file=sys.stderr)
 
     file_path = os.path.join(
         os.path.dirname(__file__), 'maps', 'map_%d_icons.png' % map.id)

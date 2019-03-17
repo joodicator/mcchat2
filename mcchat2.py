@@ -310,6 +310,10 @@ class Client(PacketHandler, Thread):
                 self.serve_query('map')
             self.exit_cond.wait()
 
+            if self.connection.connection is not None \
+            and self.connection.connection.networking_thread is not None:
+                self.connection.connection.networking_thread.join(1)
+
     def interrupt(self):
         self.exit(ManualExit())
 
