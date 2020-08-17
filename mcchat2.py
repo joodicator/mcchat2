@@ -14,7 +14,7 @@ import argparse
 import getpass
 import socket
 import json
-import imp
+import importlib
 import traceback
 import functools
 import itertools
@@ -146,8 +146,11 @@ def main():
     plugins = []
     if args.plugins:
         for plugin in args.plugins.split(','):
-            file, path, desc = imp.find_module(plugin, ['plugins'])
-            plugins.append(imp.load_module(plugin, file, path, desc))
+            spec = importlib.machinery.PathFinder.find_spec(plugin, ['plugins'])
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[plugin] = module
+            spec.loader.exec_module(module)
+            plugins.append(module)
 
     try: version = int(args.version)
     except ValueError: version = args.version
