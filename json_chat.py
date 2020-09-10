@@ -6,11 +6,6 @@ import json
 import sys
 import re
 
-try:
-    unicode = unicode
-except NameError:
-    unicode = str
-
 class DecodeError(Exception):
     pass
 
@@ -36,11 +31,11 @@ def decode_string(data):
         return data
 
 def decode_struct(data):
-    if type(data) is unicode:
+    if isinstance(data, str):
         return data
-    elif type(data) is list:
+    elif isinstance(data, list):
         return ''.join(decode_struct(part) for part in data)
-    elif type(data) is dict:
+    elif isinstance(data, dict):
         if 'text' in data:
             result = decode_struct(data['text'])
         elif 'translate' in data:

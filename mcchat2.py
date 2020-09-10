@@ -597,8 +597,6 @@ def h_chat_message(self, packet):
                     omit_message = True
 
         chat_string = json_chat.decode_string(packet.json_data)
-        if type(chat_string) is not str:
-            chat_string = chat_string.encode('utf8')
         fprint(chat_string, file=sys.stderr if omit_message else sys.stdout)
 
         if new_players is not None:
@@ -946,10 +944,11 @@ def load_auth_tokens(file_path=AUTH_TOKENS_FILE):
         with open(file_path) as file:
             if os.name == 'posix':
                 fstat = os.fstat(file.fileno())
-                if fstat.st_mode & AUTH_TOKENS_MODE_WARN:
+                fmode = stat.S_IMODE(fstat.st_mode)
+                if fmode & AUTH_TOKENS_MODE_WARN:
                     fprint('Warning: %s is not protected from access by other'
                            ' users (access mode %03o; should be %03o).'
-                           % (AUTH_TOKENS_FILE, fstat.st_mode, AUTH_TOKENS_MODE),
+                           % (AUTH_TOKENS_FILE, fmode, AUTH_TOKENS_MODE),
                            file=sys.stderr)
             try:
                 return json.load(file)
