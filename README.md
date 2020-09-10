@@ -14,7 +14,7 @@ A machine-usable Minecraft chat console client.
 ## Dependencies
 
 ### Required
-* [Python](http://python.org/) 2.7 or 3
+* [Python](http://python.org/) 3
 * [future](http://python-future.org)
 * [mcstatus](//github.com/joodicator/mcstatus) (included as a Git submodule)
   * [dnspython](http://www.dnspython.org)
